@@ -1,10 +1,12 @@
-"""编程智能体的第二个版本：一个循环和五个本地工具。"""
+"""编程智能体的第三个版本：在五工具系统前增加权限检查。"""
 
 import json
 import os
+import re
 import subprocess
+from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -22,6 +24,8 @@ SYSTEM_PROMPT = (
     "Never claim to be Claude, Anthropic, OpenAI, or ChatGPT. "
     "Use the provided tools to inspect or change the local project. "
     "Prefer dedicated file tools over bash for file operations. "
+    "Tool calls may be denied by the local permission system. "
+    "If a call is denied, do not claim it succeeded; choose a safer approach. "
     "When the task is complete, answer the user directly."
 )
 
@@ -223,6 +227,132 @@ TOOL_HANDLERS: Dict[str, Callable[..., str]] = {
 }
 
 
+class PermissionDecision(str, Enum):
+    """权限管线可能产生的三种决定。"""
+
+    ALLOW = "allow"
+    DENY = "deny"
+    ASK = "ask"
+
+
+# 第一关：这些 Bash 片段风险过高，即使用户确认也不执行。
+HARD_DENY_PATTERNS = (
+    "rm -rf /",
+    "sudo ",
+    "shutdown",
+    "reboot",
+    "mkfs",
+    "dd if=",
+    "> /dev/sda",
+)
+
+# 第二关：这些命令可能有破坏性，但具体文件可能确实需要用户删除。
+DESTRUCTIVE_BASH_PATTERN = re.compile(
+    r"(?i)(?:^|[;&|()\n])\s*(?:rm|rmdir)(?=\s|$|[;&|()])"
+)
+
+
+def path_is_outside_workspace(path: str) -> bool:
+    """判断工具参数中的路径是否越过当前工作目录。"""
+    try:
+        (WORKDIR / path).resolve().relative_to(WORKDIR)
+    except (OSError, ValueError):
+        return True
+    return False
+
+
+def check_hard_deny(tool_name: str, arguments: Dict[str, Any]) -> Optional[str]:
+    """第一关：匹配无条件禁止的高危 Bash 命令。"""
+    if tool_name != "bash":
+        return None
+
+    command = str(arguments.get("command", "")).lower()
+    for pattern in HARD_DENY_PATTERNS:
+        if pattern in command:
+            return f"命令包含永久禁止的高危片段：{pattern}"
+    return None
+
+
+def check_permission_rules(
+    tool_name: str, arguments: Dict[str, Any]
+) -> Optional[Tuple[PermissionDecision, str]]:
+    """第二关：根据工具名称和结构化参数匹配权限规则。"""
+    if tool_name in {"read_file", "write_file", "edit_file"}:
+        path = arguments.get("path")
+        if not isinstance(path, str) or path_is_outside_workspace(path):
+            return PermissionDecision.DENY, "文件路径超出当前工作目录"
+
+    if tool_name == "glob":
+        pattern = arguments.get("pattern")
+        if not isinstance(pattern, str):
+            return PermissionDecision.DENY, "glob 模式必须是字符串"
+        pattern_path = Path(pattern)
+        if pattern_path.is_absolute() or ".." in pattern_path.parts:
+            return PermissionDecision.DENY, "glob 模式超出当前工作目录"
+
+    if tool_name == "bash":
+        command = arguments.get("command")
+        if not isinstance(command, str):
+            return PermissionDecision.DENY, "Bash 命令必须是字符串"
+        if DESTRUCTIVE_BASH_PATTERN.search(command):
+            return PermissionDecision.ASK, "命令可能删除文件或目录"
+        if "> /etc/" in command or "chmod 777" in command:
+            return PermissionDecision.ASK, "命令可能修改敏感位置或权限"
+
+    return None
+
+
+def evaluate_permission(
+    tool_name: str, arguments: Dict[str, Any]
+) -> Tuple[PermissionDecision, str]:
+    """依次执行硬拒绝和规则匹配，返回权限决定及原因。"""
+    hard_deny_reason = check_hard_deny(tool_name, arguments)
+    if hard_deny_reason:
+        return PermissionDecision.DENY, hard_deny_reason
+
+    matched_rule = check_permission_rules(tool_name, arguments)
+    if matched_rule:
+        return matched_rule
+
+    return PermissionDecision.ALLOW, "常规工作区操作"
+
+
+def request_user_approval(
+    tool_name: str, arguments: Dict[str, Any], reason: str
+) -> bool:
+    """第三关：展示风险操作，并让用户决定是否继续。"""
+    arguments_text = json.dumps(arguments, ensure_ascii=False)
+    if len(arguments_text) > 500:
+        arguments_text = arguments_text[:500] + "……"
+
+    print(f"[需要确认] {reason}")
+    print(f"工具：{tool_name}")
+    print(f"参数：{arguments_text}")
+    choice = input("允许执行吗？[y/N] ").strip().lower()
+    return choice in {"y", "yes"}
+
+
+def check_permission(
+    tool_name: str, arguments: Dict[str, Any]
+) -> Tuple[bool, str]:
+    """串联三道权限门，并返回是否允许以及可反馈给模型的结果。"""
+    decision, reason = evaluate_permission(tool_name, arguments)
+
+    if decision == PermissionDecision.DENY:
+        message = f"权限拒绝：{reason}"
+        print(f"[已阻止] {reason}")
+        return False, message
+
+    if decision == PermissionDecision.ASK:
+        if not request_user_approval(tool_name, arguments, reason):
+            message = f"用户拒绝执行：{reason}"
+            print("[未执行] 用户没有批准本次工具调用")
+            return False, message
+        print("[已允许] 用户批准本次工具调用")
+
+    return True, ""
+
+
 def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
     """根据工具名称查找处理函数，并统一返回执行结果。"""
     handler = TOOL_HANDLERS.get(name)
@@ -260,11 +390,17 @@ def agent_loop(client: OpenAI, messages: List[Dict[str, Any]]) -> None:
 
                 if tool_name == "bash":
                     command = arguments["command"]
-                    print(f"$ {command}")
+                    print(f"[请求 bash] $ {command}")
                 else:
-                    print(f"[{tool_name}]")
+                    print(f"[请求 {tool_name}]")
 
-                result = execute_tool(tool_name, arguments)
+                allowed, permission_result = check_permission(
+                    tool_name, arguments
+                )
+                if allowed:
+                    result = execute_tool(tool_name, arguments)
+                else:
+                    result = permission_result
             except (json.JSONDecodeError, KeyError, TypeError) as exc:
                 result = f"错误：工具参数无效：{exc}"
 
