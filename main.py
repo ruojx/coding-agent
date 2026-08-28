@@ -1,4 +1,4 @@
-"""编程智能体的第六个版本：增加 Subagent 子任务上下文。"""
+"""编程智能体的第七个版本：增加按需加载 Skill 的能力。"""
 
 import ast
 import json
@@ -18,8 +18,9 @@ load_dotenv()
 BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
 WORKDIR = Path.cwd().resolve()
+SKILLS_DIR = WORKDIR / "skills"
 
-SYSTEM_PROMPT = (
+BASE_SYSTEM_PROMPT = (
     f"You are Coding Agent, a local coding agent powered by DeepSeek. "
     f"You are working in {WORKDIR}. "
     "Never claim to be Claude, Anthropic, OpenAI, or ChatGPT. "
@@ -29,20 +30,153 @@ SYSTEM_PROMPT = (
     "then update todo status as you work. "
     "Use the task tool for focused subtasks that can be handled in an "
     "isolated context, such as file inspection or localized analysis. "
+    "Use load_skill to read full skill instructions when a listed skill "
+    "applies to the current task. "
     "Tool calls may be denied by the local permission system. "
     "If a call is denied, do not claim it succeeded; choose a safer approach. "
     "When the task is complete, answer the user directly."
 )
 
-SUBAGENT_SYSTEM_PROMPT = (
+BASE_SUBAGENT_SYSTEM_PROMPT = (
     f"You are a focused subagent inside Coding Agent. "
     f"You are working in {WORKDIR}. "
     "Complete only the delegated subtask. "
     "Use tools when needed, but keep the final answer concise. "
+    "Use load_skill when the delegated subtask matches a listed skill. "
     "Do not claim to be Claude, Anthropic, OpenAI, or ChatGPT. "
     "Your intermediate tool calls stay in your own context; "
     "only your final summary returns to the parent agent."
 )
+
+
+class SkillLoader:
+    """扫描 skills 目录，只把技能目录放进系统提示。"""
+
+    def __init__(self, skills_dir: Path) -> None:
+        self.skills_dir = skills_dir
+        self.skills: Dict[str, Dict[str, str]] = {}
+
+    def scan(self) -> None:
+        """读取 skills/*/SKILL.md 的元信息，建立名称到正文的索引。"""
+        self.skills.clear()
+        if not self.skills_dir.exists():
+            return
+
+        root = self.skills_dir.resolve()
+        for manifest in sorted(self.skills_dir.glob("*/SKILL.md")):
+            resolved = manifest.resolve()
+            try:
+                resolved.relative_to(root)
+            except ValueError:
+                continue
+            if not resolved.is_file():
+                continue
+
+            content = resolved.read_text(encoding="utf-8")
+            metadata, body = self.parse_frontmatter(content)
+            name = self.clean_metadata(metadata.get("name"))
+            if not name:
+                name = manifest.parent.name
+
+            description = self.clean_metadata(metadata.get("description"))
+            if not description:
+                description = self.first_body_line(body)
+            try:
+                display_path = str(resolved.relative_to(WORKDIR))
+            except ValueError:
+                display_path = str(resolved)
+
+            self.skills[name] = {
+                "name": name,
+                "description": description,
+                "content": content,
+                "path": display_path,
+            }
+
+    def catalog(self) -> str:
+        """返回只包含名称和描述的技能目录。"""
+        if not self.skills:
+            return "- 暂无可用技能"
+
+        lines = []
+        for name in sorted(self.skills):
+            description = self.skills[name]["description"]
+            lines.append(f"- {name}: {description}")
+        return "\n".join(lines)
+
+    def load(self, name: str) -> str:
+        """按技能名称返回完整 SKILL.md，不把 name 当作文件路径。"""
+        skill = self.skills.get(name)
+        if skill is None:
+            available = ", ".join(sorted(self.skills)) or "none"
+            return f"错误：未知技能 {name}。可用技能：{available}"
+
+        return (
+            f"已加载技能：{skill['name']}\n"
+            f"来源：{skill['path']}\n\n"
+            f"{skill['content']}"
+        )
+
+    def parse_frontmatter(
+        self, content: str
+    ) -> Tuple[Dict[str, str], str]:
+        """解析最小 YAML frontmatter，只支持 key: value 形式。"""
+        if not content.startswith("---\n"):
+            return {}, content
+
+        end_marker = content.find("\n---\n", 4)
+        if end_marker == -1:
+            return {}, content
+
+        metadata_text = content[4:end_marker]
+        body = content[end_marker + len("\n---\n"):]
+        metadata: Dict[str, str] = {}
+        for line in metadata_text.splitlines():
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key:
+                metadata[key] = value
+        return metadata, body
+
+    def clean_metadata(self, value: Optional[str]) -> str:
+        """清理 frontmatter 字段，避免空值进入技能目录。"""
+        if not isinstance(value, str):
+            return ""
+        return " ".join(value.strip().split())
+
+    def first_body_line(self, body: str) -> str:
+        """没有 description 时，用正文第一行作为兜底描述。"""
+        for line in body.splitlines():
+            text = line.strip().lstrip("#").strip()
+            if text:
+                return " ".join(text.split())
+        return "无描述"
+
+
+SKILL_LOADER = SkillLoader(SKILLS_DIR)
+
+
+def build_system_prompt() -> str:
+    """运行时拼接主 Agent 提示词和技能目录。"""
+    SKILL_LOADER.scan()
+    return (
+        f"{BASE_SYSTEM_PROMPT}\n\n"
+        f"Available skills:\n{SKILL_LOADER.catalog()}\n\n"
+        "Call load_skill with a skill name before following its full rules."
+    )
+
+
+def build_subagent_system_prompt() -> str:
+    """运行时拼接子 Agent 提示词和同一份技能目录。"""
+    SKILL_LOADER.scan()
+    return (
+        f"{BASE_SUBAGENT_SYSTEM_PROMPT}\n\n"
+        f"Available skills:\n{SKILL_LOADER.catalog()}\n\n"
+        "Call load_skill with a skill name before following its full rules."
+    )
 
 TOOLS = [
     {
@@ -203,6 +337,26 @@ TOOLS = [
                     }
                 },
                 "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "load_skill",
+            "description": (
+                "Load the full SKILL.md instructions for one available "
+                "skill by name."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Skill name from the available catalog.",
+                    }
+                },
+                "required": ["name"],
             },
         },
     },
@@ -389,6 +543,15 @@ def run_task(prompt: str) -> str:
     return run_subagent(ACTIVE_CLIENT, prompt.strip())
 
 
+def run_load_skill(name: str) -> str:
+    """按名称加载完整技能说明，返回给模型继续使用。"""
+    if not isinstance(name, str) or not name.strip():
+        return "错误：技能名称不能为空"
+
+    SKILL_LOADER.scan()
+    return SKILL_LOADER.load(name.strip())
+
+
 TOOL_HANDLERS: Dict[str, Callable[..., str]] = {
     "bash": run_bash,
     "read_file": run_read,
@@ -397,6 +560,7 @@ TOOL_HANDLERS: Dict[str, Callable[..., str]] = {
     "glob": run_glob,
     "todo_write": run_todo_write,
     "task": run_task,
+    "load_skill": run_load_skill,
 }
 
 SUBAGENT_TOOLS = [
@@ -734,7 +898,7 @@ def agent_loop(
 def run_subagent(client: OpenAI, prompt: str) -> str:
     """用全新的 messages 列表执行子任务，避免污染主上下文。"""
     sub_messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": SUBAGENT_SYSTEM_PROMPT},
+        {"role": "system", "content": build_subagent_system_prompt()},
         {"role": "user", "content": prompt},
     ]
     final_text = agent_loop(
@@ -759,7 +923,7 @@ def main() -> None:
     client = OpenAI(api_key=api_key, base_url=BASE_URL)
     ACTIVE_CLIENT = client
     messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": SYSTEM_PROMPT}
+        {"role": "system", "content": build_system_prompt()}
     ]
 
     print("Coding Agent（输入 exit 退出）")
