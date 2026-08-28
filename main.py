@@ -1,4 +1,4 @@
-"""编程智能体的第三个版本：在五工具系统前增加权限检查。"""
+"""编程智能体的第四个版本：通过 Hook 扩展稳定的 Agent Loop。"""
 
 import json
 import os
@@ -353,6 +353,87 @@ def check_permission(
     return True, ""
 
 
+HookCallback = Callable[..., Optional[str]]
+
+HOOKS: Dict[str, List[HookCallback]] = {
+    "UserPromptSubmit": [],
+    "PreToolUse": [],
+    "PostToolUse": [],
+    "Stop": [],
+}
+
+
+def register_hook(event: str, callback: HookCallback) -> None:
+    """把回调函数注册到指定的 Hook 事件。"""
+    if event not in HOOKS:
+        raise ValueError(f"未知 Hook 事件：{event}")
+    HOOKS[event].append(callback)
+
+
+def trigger_hooks(event: str, *args: Any) -> Optional[str]:
+    """依次触发事件回调；非空返回值表示当前流程需要被拦截。"""
+    if event not in HOOKS:
+        raise ValueError(f"未知 Hook 事件：{event}")
+
+    for callback in HOOKS[event]:
+        result = callback(*args)
+        if result is not None:
+            return result
+    return None
+
+
+def prompt_context_hook(query: str) -> None:
+    """UserPromptSubmit：显示本次请求使用的工作目录。"""
+    print(f"[Hook:UserPromptSubmit] 工作目录：{WORKDIR}")
+    return None
+
+
+def permission_hook(
+    tool_name: str, arguments: Dict[str, Any]
+) -> Optional[str]:
+    """PreToolUse：复用 S03 权限管线，拒绝时返回原因。"""
+    allowed, result = check_permission(tool_name, arguments)
+    return None if allowed else result
+
+
+def tool_log_hook(tool_name: str, arguments: Dict[str, Any]) -> None:
+    """PreToolUse：记录即将执行的工具及参数摘要。"""
+    arguments_text = json.dumps(arguments, ensure_ascii=False)
+    if len(arguments_text) > 120:
+        arguments_text = arguments_text[:120] + "……"
+    print(f"[Hook:PreToolUse] {tool_name} {arguments_text}")
+    return None
+
+
+def large_output_hook(
+    tool_name: str, arguments: Dict[str, Any], output: str
+) -> None:
+    """PostToolUse：工具输出过大时给出提醒，但暂不截断。"""
+    del arguments
+    if len(output) > 100_000:
+        print(
+            f"[Hook:PostToolUse] 警告：{tool_name} 输出了 "
+            f"{len(output)} 个字符"
+        )
+    return None
+
+
+def stop_summary_hook(messages: List[Dict[str, Any]]) -> None:
+    """Stop：在 Agent 即将结束时统计当前会话的工具结果数。"""
+    tool_count = sum(
+        1 for message in messages if message.get("role") == "tool"
+    )
+    print(f"[Hook:Stop] 当前会话共返回 {tool_count} 个工具结果")
+    return None
+
+
+register_hook("UserPromptSubmit", prompt_context_hook)
+register_hook("PreToolUse", permission_hook)
+register_hook("PreToolUse", tool_log_hook)
+register_hook("PostToolUse", large_output_hook)
+register_hook("Stop", stop_summary_hook)
+
+
 def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
     """根据工具名称查找处理函数，并统一返回执行结果。"""
     handler = TOOL_HANDLERS.get(name)
@@ -378,6 +459,10 @@ def agent_loop(client: OpenAI, messages: List[Dict[str, Any]]) -> None:
         messages.append(assistant_message.model_dump(exclude_none=True))
 
         if not assistant_message.tool_calls:
+            continuation = trigger_hooks("Stop", messages)
+            if continuation is not None:
+                messages.append({"role": "user", "content": continuation})
+                continue
             print(assistant_message.content or "")
             return
 
@@ -394,13 +479,16 @@ def agent_loop(client: OpenAI, messages: List[Dict[str, Any]]) -> None:
                 else:
                     print(f"[请求 {tool_name}]")
 
-                allowed, permission_result = check_permission(
-                    tool_name, arguments
+                blocked = trigger_hooks(
+                    "PreToolUse", tool_name, arguments
                 )
-                if allowed:
+                if blocked is None:
                     result = execute_tool(tool_name, arguments)
+                    trigger_hooks(
+                        "PostToolUse", tool_name, arguments, result
+                    )
                 else:
-                    result = permission_result
+                    result = blocked
             except (json.JSONDecodeError, KeyError, TypeError) as exc:
                 result = f"错误：工具参数无效：{exc}"
 
@@ -438,6 +526,7 @@ def main() -> None:
         if not query:
             continue
 
+        trigger_hooks("UserPromptSubmit", query)
         messages.append({"role": "user", "content": query})
         agent_loop(client, messages)
 
