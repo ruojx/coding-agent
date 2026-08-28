@@ -1,5 +1,6 @@
-"""编程智能体的第四个版本：通过 Hook 扩展稳定的 Agent Loop。"""
+"""编程智能体的第五个版本：增加 TodoWrite 规划工具。"""
 
+import ast
 import json
 import os
 import re
@@ -24,6 +25,8 @@ SYSTEM_PROMPT = (
     "Never claim to be Claude, Anthropic, OpenAI, or ChatGPT. "
     "Use the provided tools to inspect or change the local project. "
     "Prefer dedicated file tools over bash for file operations. "
+    "For multi-step tasks, call todo_write first to make a plan, "
+    "then update todo status as you work. "
     "Tool calls may be denied by the local permission system. "
     "If a call is denied, do not claim it succeeded; choose a safer approach. "
     "When the task is complete, answer the user directly."
@@ -132,6 +135,45 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "todo_write",
+            "description": (
+                "Create or update the current task plan before and during "
+                "multi-step coding work."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "description": "The full current task list.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {
+                                    "type": "string",
+                                    "description": "A concrete task step.",
+                                },
+                                "status": {
+                                    "type": "string",
+                                    "enum": [
+                                        "pending",
+                                        "in_progress",
+                                        "completed",
+                                    ],
+                                    "description": "Current status.",
+                                },
+                            },
+                            "required": ["content", "status"],
+                        },
+                    }
+                },
+                "required": ["todos"],
+            },
+        },
+    },
 ]
 
 
@@ -218,12 +260,99 @@ def run_bash(command: str) -> str:
     return output if output else "(no output)"
 
 
+class TodoManager:
+    """保存当前会话中的任务计划，并校验模型传入的 todo 列表。"""
+
+    VALID_STATUSES = {"pending", "in_progress", "completed"}
+
+    def __init__(self) -> None:
+        self.items: List[Dict[str, str]] = []
+
+    def update(self, todos: Any) -> str:
+        """用模型提交的新列表替换当前计划，并返回可读进度。"""
+        if isinstance(todos, str):
+            todos = self._parse_todos_text(todos)
+        if not isinstance(todos, list):
+            raise ValueError("todos 必须是列表")
+        if len(todos) > 20:
+            raise ValueError("todos 最多只能包含 20 项")
+
+        validated: List[Dict[str, str]] = []
+        in_progress_count = 0
+        for index, todo in enumerate(todos):
+            if not isinstance(todo, dict):
+                raise ValueError(f"todos[{index}] 必须是对象")
+
+            content = str(todo.get("content", "")).strip()
+            status = str(todo.get("status", "pending")).strip()
+            if not content:
+                raise ValueError(f"todos[{index}] 缺少 content")
+            if status not in self.VALID_STATUSES:
+                raise ValueError(
+                    f"todos[{index}] 的 status 不合法：{status}"
+                )
+            if status == "in_progress":
+                in_progress_count += 1
+
+            validated.append({"content": content, "status": status})
+
+        if in_progress_count > 1:
+            raise ValueError("同一时间最多只能有一个 in_progress 任务")
+
+        self.items = validated
+        return self.render()
+
+    def render(self) -> str:
+        """把当前 todo 状态渲染成终端和模型都容易读懂的文本。"""
+        if not self.items:
+            return "当前没有任务计划"
+
+        marker_by_status = {
+            "pending": "[ ]",
+            "in_progress": "[>]",
+            "completed": "[x]",
+        }
+        lines = ["## 当前任务计划"]
+        for todo in self.items:
+            marker = marker_by_status[todo["status"]]
+            lines.append(f"{marker} {todo['content']}")
+
+        completed_count = sum(
+            todo["status"] == "completed" for todo in self.items
+        )
+        lines.append(f"\n进度：{completed_count}/{len(self.items)} 已完成")
+        return "\n".join(lines)
+
+    def _parse_todos_text(self, todos: str) -> Any:
+        """兼容 JSON 字符串和 Python 字面量字符串，但不使用 eval。"""
+        try:
+            return json.loads(todos)
+        except json.JSONDecodeError:
+            try:
+                return ast.literal_eval(todos)
+            except (SyntaxError, ValueError) as exc:
+                raise ValueError(
+                    "todos 字符串必须是 JSON 数组或安全字面量列表"
+                ) from exc
+
+
+TODO = TodoManager()
+
+
+def run_todo_write(todos: Any) -> str:
+    """更新当前任务计划；这个工具只负责规划，不直接修改文件。"""
+    output = TODO.update(todos)
+    print(output)
+    return output
+
+
 TOOL_HANDLERS: Dict[str, Callable[..., str]] = {
     "bash": run_bash,
     "read_file": run_read,
     "write_file": run_write,
     "edit_file": run_edit,
     "glob": run_glob,
+    "todo_write": run_todo_write,
 }
 
 
@@ -448,6 +577,8 @@ def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
 
 def agent_loop(client: OpenAI, messages: List[Dict[str, Any]]) -> None:
     """持续调用模型，直到模型不再请求使用工具。"""
+    rounds_since_todo = 0
+
     while True:
         response = client.chat.completions.create(
             model=MODEL,
@@ -466,6 +597,7 @@ def agent_loop(client: OpenAI, messages: List[Dict[str, Any]]) -> None:
             print(assistant_message.content or "")
             return
 
+        used_todo = False
         for tool_call in assistant_message.tool_calls:
             tool_name = tool_call.function.name
             try:
@@ -478,6 +610,8 @@ def agent_loop(client: OpenAI, messages: List[Dict[str, Any]]) -> None:
                     print(f"[请求 bash] $ {command}")
                 else:
                     print(f"[请求 {tool_name}]")
+                if tool_name == "todo_write":
+                    used_todo = True
 
                 blocked = trigger_hooks(
                     "PreToolUse", tool_name, arguments
@@ -501,6 +635,23 @@ def agent_loop(client: OpenAI, messages: List[Dict[str, Any]]) -> None:
                     "content": result,
                 }
             )
+
+        if used_todo:
+            rounds_since_todo = 0
+        else:
+            rounds_since_todo += 1
+
+        if rounds_since_todo >= 3:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "<reminder>请使用 todo_write 更新当前任务计划，"
+                        "再继续执行后续步骤。</reminder>"
+                    ),
+                }
+            )
+            rounds_since_todo = 0
 
 
 def main() -> None:
