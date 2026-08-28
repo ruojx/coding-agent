@@ -1,4 +1,4 @@
-"""编程智能体的第五个版本：增加 TodoWrite 规划工具。"""
+"""编程智能体的第六个版本：增加 Subagent 子任务上下文。"""
 
 import ast
 import json
@@ -27,9 +27,21 @@ SYSTEM_PROMPT = (
     "Prefer dedicated file tools over bash for file operations. "
     "For multi-step tasks, call todo_write first to make a plan, "
     "then update todo status as you work. "
+    "Use the task tool for focused subtasks that can be handled in an "
+    "isolated context, such as file inspection or localized analysis. "
     "Tool calls may be denied by the local permission system. "
     "If a call is denied, do not claim it succeeded; choose a safer approach. "
     "When the task is complete, answer the user directly."
+)
+
+SUBAGENT_SYSTEM_PROMPT = (
+    f"You are a focused subagent inside Coding Agent. "
+    f"You are working in {WORKDIR}. "
+    "Complete only the delegated subtask. "
+    "Use tools when needed, but keep the final answer concise. "
+    "Do not claim to be Claude, Anthropic, OpenAI, or ChatGPT. "
+    "Your intermediate tool calls stay in your own context; "
+    "only your final summary returns to the parent agent."
 )
 
 TOOLS = [
@@ -171,6 +183,26 @@ TOOLS = [
                     }
                 },
                 "required": ["todos"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task",
+            "description": (
+                "Run a focused subtask in a fresh subagent context. "
+                "Use this for isolated inspection or analysis work."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "The delegated subtask prompt.",
+                    }
+                },
+                "required": ["prompt"],
             },
         },
     },
@@ -337,6 +369,7 @@ class TodoManager:
 
 
 TODO = TodoManager()
+ACTIVE_CLIENT: Optional[OpenAI] = None
 
 
 def run_todo_write(todos: Any) -> str:
@@ -346,6 +379,16 @@ def run_todo_write(todos: Any) -> str:
     return output
 
 
+def run_task(prompt: str) -> str:
+    """启动一个同步子 Agent，并只把最终总结返回给主 Agent。"""
+    if ACTIVE_CLIENT is None:
+        return "错误：模型客户端尚未初始化，无法启动子 Agent"
+    if not isinstance(prompt, str) or not prompt.strip():
+        return "错误：task prompt 不能为空"
+
+    return run_subagent(ACTIVE_CLIENT, prompt.strip())
+
+
 TOOL_HANDLERS: Dict[str, Callable[..., str]] = {
     "bash": run_bash,
     "read_file": run_read,
@@ -353,6 +396,19 @@ TOOL_HANDLERS: Dict[str, Callable[..., str]] = {
     "edit_file": run_edit,
     "glob": run_glob,
     "todo_write": run_todo_write,
+    "task": run_task,
+}
+
+SUBAGENT_TOOLS = [
+    tool
+    for tool in TOOLS
+    if tool["function"]["name"] != "task"
+]
+
+SUBAGENT_TOOL_HANDLERS = {
+    name: handler
+    for name, handler in TOOL_HANDLERS.items()
+    if name != "task"
 }
 
 
@@ -563,9 +619,13 @@ register_hook("PostToolUse", large_output_hook)
 register_hook("Stop", stop_summary_hook)
 
 
-def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
+def execute_tool(
+    name: str,
+    arguments: Dict[str, Any],
+    handlers: Dict[str, Callable[..., str]],
+) -> str:
     """根据工具名称查找处理函数，并统一返回执行结果。"""
-    handler = TOOL_HANDLERS.get(name)
+    handler = handlers.get(name)
     if handler is None:
         return f"错误：未知工具 {name}"
 
@@ -575,15 +635,25 @@ def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
         return f"错误：{exc}"
 
 
-def agent_loop(client: OpenAI, messages: List[Dict[str, Any]]) -> None:
+def agent_loop(
+    client: OpenAI,
+    messages: List[Dict[str, Any]],
+    tools: Optional[List[Dict[str, Any]]] = None,
+    handlers: Optional[Dict[str, Callable[..., str]]] = None,
+    max_steps: int = 30,
+    agent_name: str = "Agent",
+    print_final: bool = True,
+) -> str:
     """持续调用模型，直到模型不再请求使用工具。"""
+    tools = TOOLS if tools is None else tools
+    handlers = TOOL_HANDLERS if handlers is None else handlers
     rounds_since_todo = 0
 
-    while True:
+    for _step in range(max_steps):
         response = client.chat.completions.create(
             model=MODEL,
             messages=messages,
-            tools=TOOLS,
+            tools=tools,
             tool_choice="auto",
         )
         assistant_message = response.choices[0].message
@@ -594,8 +664,10 @@ def agent_loop(client: OpenAI, messages: List[Dict[str, Any]]) -> None:
             if continuation is not None:
                 messages.append({"role": "user", "content": continuation})
                 continue
-            print(assistant_message.content or "")
-            return
+            final_text = assistant_message.content or ""
+            if print_final:
+                print(final_text)
+            return final_text
 
         used_todo = False
         for tool_call in assistant_message.tool_calls:
@@ -607,9 +679,9 @@ def agent_loop(client: OpenAI, messages: List[Dict[str, Any]]) -> None:
 
                 if tool_name == "bash":
                     command = arguments["command"]
-                    print(f"[请求 bash] $ {command}")
+                    print(f"[{agent_name} 请求 bash] $ {command}")
                 else:
-                    print(f"[请求 {tool_name}]")
+                    print(f"[{agent_name} 请求 {tool_name}]")
                 if tool_name == "todo_write":
                     used_todo = True
 
@@ -617,7 +689,7 @@ def agent_loop(client: OpenAI, messages: List[Dict[str, Any]]) -> None:
                     "PreToolUse", tool_name, arguments
                 )
                 if blocked is None:
-                    result = execute_tool(tool_name, arguments)
+                    result = execute_tool(tool_name, arguments, handlers)
                     trigger_hooks(
                         "PostToolUse", tool_name, arguments, result
                     )
@@ -653,13 +725,39 @@ def agent_loop(client: OpenAI, messages: List[Dict[str, Any]]) -> None:
             )
             rounds_since_todo = 0
 
+    final_text = f"错误：{agent_name} 达到最大循环步数 {max_steps}"
+    if print_final:
+        print(final_text)
+    return final_text
+
+
+def run_subagent(client: OpenAI, prompt: str) -> str:
+    """用全新的 messages 列表执行子任务，避免污染主上下文。"""
+    sub_messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": SUBAGENT_SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+    final_text = agent_loop(
+        client=client,
+        messages=sub_messages,
+        tools=SUBAGENT_TOOLS,
+        handlers=SUBAGENT_TOOL_HANDLERS,
+        max_steps=10,
+        agent_name="Subagent",
+        print_final=False,
+    )
+    return final_text or "子 Agent 没有返回总结"
+
 
 def main() -> None:
+    global ACTIVE_CLIENT
+
     api_key = os.getenv("DEEPSEEK_API_KEY")
     if not api_key:
         raise RuntimeError("DEEPSEEK_API_KEY is not set")
 
     client = OpenAI(api_key=api_key, base_url=BASE_URL)
+    ACTIVE_CLIENT = client
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT}
     ]
