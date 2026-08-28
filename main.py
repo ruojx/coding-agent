@@ -1,4 +1,4 @@
-"""编程智能体的第十个版本：增加可持久化 Task System。"""
+"""编程智能体的第十一个版本：让慢命令可以放到后台执行。"""
 
 import ast
 import datetime as dt
@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import subprocess
+import threading
 from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
@@ -46,6 +47,8 @@ BASE_SYSTEM_PROMPT = (
     "help future sessions. "
     "Use task-system tools for recoverable multi-task plans with dependencies "
     "or ownership. "
+    "For slow shell commands, set bash.run_in_background to true so the "
+    "command can run in the background while the loop continues. "
     "Tool calls may be denied by the local permission system. "
     "If a call is denied, do not claim it succeeded; choose a safer approach. "
     "When the task is complete, answer the user directly."
@@ -1227,6 +1230,105 @@ class TaskStore:
 
 TASKS = TaskStore(TASKS_DIR)
 
+
+@dataclass
+class BackgroundTask:
+    """记录一个后台命令的生命周期。"""
+
+    id: str
+    command: str
+    status: str
+    output: str = ""
+    exit_code: Optional[int] = None
+
+
+class BackgroundManager:
+    """管理后台命令：启动线程、保存状态、收集完成通知。"""
+
+    def __init__(self) -> None:
+        self.tasks: Dict[str, BackgroundTask] = {}
+        self._ready: List[str] = []
+        self._lock = threading.Lock()
+
+    def start(self, command: str) -> str:
+        """登记后台任务并启动守护线程，立即返回后台任务 ID。"""
+        bg_id = self.new_id()
+        task = BackgroundTask(id=bg_id, command=command, status="running")
+        with self._lock:
+            self.tasks[bg_id] = task
+
+        thread = threading.Thread(
+            target=self._run,
+            args=(bg_id, command),
+            daemon=True,
+        )
+        thread.start()
+        return bg_id
+
+    def _run(self, bg_id: str, command: str) -> None:
+        """在线程中执行命令，完成后把结果放入待通知队列。"""
+        try:
+            output, exit_code = run_bash_process(command)
+            status = "completed" if exit_code == 0 else "failed"
+        except Exception as exc:
+            output = f"Error: {exc}"
+            exit_code = None
+            status = "failed"
+
+        with self._lock:
+            task = self.tasks[bg_id]
+            task.status = status
+            task.output = output
+            task.exit_code = exit_code
+            self._ready.append(bg_id)
+
+    def collect(self) -> List[str]:
+        """取出已经完成但还没有注入给模型的后台结果。"""
+        notifications = []
+        with self._lock:
+            ready_ids = list(self._ready)
+            self._ready.clear()
+            for bg_id in ready_ids:
+                task = self.tasks[bg_id]
+                notifications.append(self.format_notification(task))
+        return notifications
+
+    def status_text(self) -> str:
+        """返回当前后台任务状态，方便模型或用户查询。"""
+        with self._lock:
+            if not self.tasks:
+                return "当前没有后台任务"
+            lines = []
+            for task in self.tasks.values():
+                line = f"- {task.id}: {task.status} — {task.command}"
+                if task.exit_code is not None:
+                    line += f" (exit_code={task.exit_code})"
+                lines.append(line)
+        return "\n".join(lines)
+
+    def format_notification(self, task: BackgroundTask) -> str:
+        """把后台结果格式化为独立通知，不复用原始 tool_call_id。"""
+        output = truncate_output(task.output, limit=4000)
+        return (
+            "<task_notification>\n"
+            f"后台任务：{task.id}\n"
+            f"状态：{task.status}\n"
+            f"命令：{task.command}\n"
+            f"退出码：{task.exit_code}\n"
+            f"输出：\n{output}\n"
+            "</task_notification>"
+        )
+
+    def new_id(self) -> str:
+        """生成短后台任务 ID，方便在日志和通知中阅读。"""
+        while True:
+            bg_id = f"bg_{secrets.token_hex(4)}"
+            if bg_id not in self.tasks:
+                return bg_id
+
+
+BACKGROUND = BackgroundManager()
+
 TOOLS = [
     {
         "type": "function",
@@ -1239,6 +1341,13 @@ TOOLS = [
                     "command": {
                         "type": "string",
                         "description": "The shell command to execute.",
+                    },
+                    "run_in_background": {
+                        "type": "boolean",
+                        "description": (
+                            "Set to true only for slow commands that should "
+                            "continue in the background."
+                        ),
                     }
                 },
                 "required": ["command"],
@@ -1632,8 +1741,16 @@ def run_glob(pattern: str) -> str:
     return "\n".join(shown)
 
 
-def run_bash(command: str) -> str:
-    """执行一条 Shell 命令，并返回标准输出和错误输出。"""
+def truncate_output(output: str, limit: int = 12000) -> str:
+    """限制工具输出长度，避免超长结果挤爆上下文。"""
+    if len(output) <= limit:
+        return output
+    omitted = len(output) - limit
+    return output[:limit] + f"\n……输出过长，已省略 {omitted} 个字符"
+
+
+def run_bash_process(command: str) -> Tuple[str, int]:
+    """底层 Bash 执行函数：同步等待命令结束，返回输出和退出码。"""
     try:
         completed = subprocess.run(
             command,
@@ -1644,12 +1761,58 @@ def run_bash(command: str) -> str:
             timeout=60,
         )
     except subprocess.TimeoutExpired:
-        return "Error: command timed out after 60 seconds"
+        return "Error: command timed out after 60 seconds", 124
     except OSError as exc:
-        return f"Error: {exc}"
+        return f"Error: {exc}", 1
 
     output = (completed.stdout + completed.stderr).strip()
-    return output if output else "(no output)"
+    return output if output else "(no output)", completed.returncode
+
+
+def run_bash(command: str, run_in_background: bool = False) -> str:
+    """执行 Shell 命令；慢操作可显式放到后台。"""
+    if run_in_background is True:
+        bg_id = start_background_task(command)
+        return (
+            f"[Background task {bg_id} started]\n"
+            "命令正在后台执行；后续轮次会以 <task_notification> 注入结果。"
+        )
+
+    output, exit_code = run_bash_process(command)
+    if exit_code != 0:
+        return f"{output}\n(exit_code={exit_code})"
+    return output
+
+
+def should_run_background(tool_name: str, arguments: Dict[str, Any]) -> bool:
+    """S11 的显式判断：只有 bash 且参数为 true，才后台执行。"""
+    return (
+        tool_name == "bash"
+        and arguments.get("run_in_background") is True
+    )
+
+
+def start_background_task(command: str) -> str:
+    """启动后台任务，并返回 bg_id。"""
+    return BACKGROUND.start(command)
+
+
+def collect_background_results() -> List[str]:
+    """收集已经完成的后台任务通知。"""
+    return BACKGROUND.collect()
+
+
+def inject_background_results(messages: List[Dict[str, Any]]) -> None:
+    """在每次 LLM 调用前，把后台完成结果注入上下文。"""
+    notifications = collect_background_results()
+    if not notifications:
+        return
+    messages.append(
+        {
+            "role": "user",
+            "content": "\n\n".join(notifications),
+        }
+    )
 
 
 class TodoManager:
@@ -1935,6 +2098,12 @@ def check_permission_rules(
         command = arguments.get("command")
         if not isinstance(command, str):
             return PermissionDecision.DENY, "Bash 命令必须是字符串"
+        run_in_background = arguments.get("run_in_background")
+        if (
+            "run_in_background" in arguments
+            and not isinstance(run_in_background, bool)
+        ):
+            return PermissionDecision.DENY, "run_in_background 必须是布尔值"
         if DESTRUCTIVE_BASH_PATTERN.search(command):
             return PermissionDecision.ASK, "命令可能删除文件或目录"
         if "> /etc/" in command or "chmod 777" in command:
@@ -2086,6 +2255,12 @@ def execute_tool(
         return f"错误：未知工具 {name}"
 
     try:
+        if should_run_background(name, arguments):
+            bg_id = start_background_task(arguments["command"])
+            return (
+                f"[Background task {bg_id} started]\n"
+                "命令正在后台执行；后续轮次会以 <task_notification> 注入结果。"
+            )
         return handler(**arguments)
     except (OSError, UnicodeError, TypeError, ValueError) as exc:
         return f"错误：{exc}"
@@ -2109,6 +2284,7 @@ def agent_loop(
     reactive_retries = 0
 
     for _step in range(max_steps):
+        inject_background_results(messages)
         messages[:] = COMPACTOR.prepare(client, messages, active_request)
         try:
             response = client.chat.completions.create(
