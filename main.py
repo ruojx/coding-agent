@@ -1,4 +1,4 @@
-"""编程智能体的第九个版本：增加跨会话 Memory 能力。"""
+"""编程智能体的第十个版本：增加可持久化 Task System。"""
 
 import ast
 import datetime as dt
@@ -6,7 +6,9 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import subprocess
+from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -25,6 +27,7 @@ TRANSCRIPTS_DIR = WORKDIR / ".transcripts"
 TASK_OUTPUTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
 MEMORY_DIR = WORKDIR / ".memory"
 MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
+TASKS_DIR = WORKDIR / ".tasks"
 
 BASE_SYSTEM_PROMPT = (
     f"You are Coding Agent, a local coding agent powered by DeepSeek. "
@@ -41,6 +44,8 @@ BASE_SYSTEM_PROMPT = (
     "Use compact after finishing a stage when older details can be summarized. "
     "Use remember only for durable preferences or project facts that should "
     "help future sessions. "
+    "Use task-system tools for recoverable multi-task plans with dependencies "
+    "or ownership. "
     "Tool calls may be denied by the local permission system. "
     "If a call is denied, do not claim it succeeded; choose a safer approach. "
     "When the task is complete, answer the user directly."
@@ -965,6 +970,263 @@ class MemoryStore:
 
 MEMORY = MemoryStore(MEMORY_DIR, MEMORY_INDEX)
 
+
+@dataclass
+class Task:
+    """一个可恢复任务节点，对应 .tasks/{id}.json。"""
+
+    id: str
+    subject: str
+    description: str
+    status: str
+    owner: Optional[str]
+    blockedBy: List[str]
+
+
+class TaskStore:
+    """用 JSON 文件保存任务图，并校验状态流转和依赖关系。"""
+
+    VALID_STATUSES = {"pending", "in_progress", "completed"}
+    ID_PATTERN = re.compile(r"^task_[0-9a-f]{8}$")
+
+    def __init__(self, tasks_dir: Path) -> None:
+        self.tasks_dir = tasks_dir
+
+    def ensure(self) -> None:
+        """确保任务目录存在。"""
+        self.tasks_dir.mkdir(parents=True, exist_ok=True)
+
+    def create(self, subject: str, description: str = "") -> Task:
+        """创建一个没有依赖的新任务，并写入磁盘。"""
+        subject = self.clean(subject)
+        description = description.strip() if isinstance(description, str) else ""
+        if not subject:
+            raise ValueError("任务 subject 不能为空")
+
+        self.ensure()
+        for _attempt in range(100):
+            task_id = f"task_{secrets.token_hex(4)}"
+            path = self.path_for(task_id)
+            if path.exists():
+                continue
+            task = Task(
+                id=task_id,
+                subject=subject,
+                description=description,
+                status="pending",
+                owner=None,
+                blockedBy=[],
+            )
+            self.save(task, exclusive=True)
+            return task
+        raise RuntimeError("无法生成唯一任务 ID")
+
+    def get(self, task_id: str) -> Task:
+        """读取一个任务并返回结构化对象。"""
+        path = self.path_for(task_id)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError as exc:
+            raise ValueError(f"任务不存在：{task_id}") from exc
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"任务文件损坏：{task_id}") from exc
+
+        return self.task_from_dict(data)
+
+    def list(self) -> List[Task]:
+        """读取全部任务，按 ID 排序返回。"""
+        self.ensure()
+        tasks = []
+        for path in sorted(self.tasks_dir.glob("task_*.json")):
+            try:
+                tasks.append(self.get(path.stem))
+            except ValueError:
+                continue
+        return tasks
+
+    def update_dependencies(
+        self, task_id: str, add_blocked_by: List[str]
+    ) -> Task:
+        """给 pending 且未认领的任务增加前置依赖。"""
+        task = self.get(task_id)
+        if task.status != "pending" or task.owner is not None:
+            raise ValueError("只有 pending 且未认领的任务可以修改依赖")
+        if not isinstance(add_blocked_by, list):
+            raise ValueError("addBlockedBy 必须是任务 ID 列表")
+
+        dependencies = []
+        for dependency_id in add_blocked_by:
+            dependency_id = self.clean(dependency_id)
+            self.validate_task_id(dependency_id)
+            if dependency_id == task_id:
+                raise ValueError("任务不能依赖自己")
+            self.get(dependency_id)
+            dependencies.append(dependency_id)
+
+        original = list(task.blockedBy)
+        for dependency_id in dependencies:
+            if dependency_id not in task.blockedBy:
+                task.blockedBy.append(dependency_id)
+        self.save(task)
+        if self.has_cycle(task_id):
+            task.blockedBy = original
+            self.save(task)
+            raise ValueError("新增依赖会形成循环")
+
+        return task
+
+    def claim(self, task_id: str, owner: str = "agent") -> str:
+        """认领一个无阻塞的 pending 任务。"""
+        task = self.get(task_id)
+        owner = self.clean(owner) or "agent"
+        if task.status != "pending":
+            return f"Task {task.id} is {task.status}, cannot claim"
+
+        dependencies = self.incomplete_dependencies(task)
+        if dependencies:
+            return f"Blocked by: {', '.join(dependencies)}"
+
+        task.owner = owner
+        task.status = "in_progress"
+        self.save(task)
+        return f"Claimed {task.id} ({task.subject}) by {owner}"
+
+    def complete(self, task_id: str, owner: str = "agent") -> str:
+        """完成任务，并报告因此刚刚解除阻塞的下游任务。"""
+        task = self.get(task_id)
+        owner = self.clean(owner) or "agent"
+        if task.status != "in_progress":
+            return f"Task {task.id} is {task.status}, cannot complete"
+        if task.owner != owner:
+            return f"Task {task.id} is owned by {task.owner}, not {owner}"
+
+        ready_before = {
+            item.id
+            for item in self.list()
+            if item.status == "pending"
+            and item.blockedBy
+            and self.can_start(item.id)
+        }
+        task.status = "completed"
+        self.save(task)
+
+        unblocked = [
+            item
+            for item in self.list()
+            if item.status == "pending"
+            and item.blockedBy
+            and item.id not in ready_before
+            and self.can_start(item.id)
+        ]
+        message = f"Completed {task.id} ({task.subject})"
+        if unblocked:
+            subjects = ", ".join(
+                f"{item.id} ({item.subject})" for item in unblocked
+            )
+            message += f"\nUnblocked: {subjects}"
+        return message
+
+    def can_start(self, task_id: str) -> bool:
+        """判断任务的全部前置依赖是否都已 completed。"""
+        return not self.incomplete_dependencies(self.get(task_id))
+
+    def incomplete_dependencies(self, task: Task) -> List[str]:
+        """返回尚未完成或已经丢失的依赖任务 ID。"""
+        incomplete = []
+        for dependency_id in task.blockedBy:
+            try:
+                dependency = self.get(dependency_id)
+            except ValueError:
+                incomplete.append(dependency_id)
+                continue
+            if dependency.status != "completed":
+                incomplete.append(dependency_id)
+        return incomplete
+
+    def has_cycle(self, start_id: str) -> bool:
+        """从目标任务出发检查 blockedBy 图里是否出现环。"""
+        visiting = set()
+        visited = set()
+
+        def visit(task_id: str) -> bool:
+            if task_id in visiting:
+                return True
+            if task_id in visited:
+                return False
+            visiting.add(task_id)
+            try:
+                task = self.get(task_id)
+            except ValueError:
+                visiting.remove(task_id)
+                visited.add(task_id)
+                return False
+            for dependency_id in task.blockedBy:
+                if visit(dependency_id):
+                    return True
+            visiting.remove(task_id)
+            visited.add(task_id)
+            return False
+
+        return visit(start_id)
+
+    def save(self, task: Task, exclusive: bool = False) -> None:
+        """把任务保存成 JSON 文件。"""
+        self.ensure()
+        self.validate_task(task)
+        path = self.path_for(task.id)
+        if exclusive and path.exists():
+            raise FileExistsError(path)
+        path.write_text(
+            json.dumps(asdict(task), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    def task_from_dict(self, data: Dict[str, Any]) -> Task:
+        """把 JSON 字典转换成 Task，并做字段校验。"""
+        task = Task(
+            id=str(data.get("id", "")),
+            subject=str(data.get("subject", "")),
+            description=str(data.get("description", "")),
+            status=str(data.get("status", "")),
+            owner=data.get("owner"),
+            blockedBy=list(data.get("blockedBy", [])),
+        )
+        self.validate_task(task)
+        return task
+
+    def validate_task(self, task: Task) -> None:
+        """校验任务文件的核心字段。"""
+        self.validate_task_id(task.id)
+        if not self.clean(task.subject):
+            raise ValueError("任务 subject 不能为空")
+        if task.status not in self.VALID_STATUSES:
+            raise ValueError(f"任务状态不合法：{task.status}")
+        if task.owner is not None and not isinstance(task.owner, str):
+            raise ValueError("任务 owner 必须是字符串或 null")
+        if not isinstance(task.blockedBy, list):
+            raise ValueError("blockedBy 必须是列表")
+        for dependency_id in task.blockedBy:
+            self.validate_task_id(str(dependency_id))
+
+    def validate_task_id(self, task_id: str) -> None:
+        """限制任务 ID 只能是 task_ 加 8 位十六进制字符。"""
+        if not isinstance(task_id, str) or not self.ID_PATTERN.match(task_id):
+            raise ValueError(f"任务 ID 不合法：{task_id}")
+
+    def path_for(self, task_id: str) -> Path:
+        """根据任务 ID 返回任务文件路径。"""
+        self.validate_task_id(task_id)
+        return self.tasks_dir / f"{task_id}.json"
+
+    def clean(self, value: Any) -> str:
+        """清理字符串字段。"""
+        if not isinstance(value, str):
+            return ""
+        return " ".join(value.strip().split())
+
+
+TASKS = TaskStore(TASKS_DIR)
+
 TOOLS = [
     {
         "type": "function",
@@ -1194,6 +1456,116 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_task",
+            "description": "Create a persisted task record in .tasks.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subject": {
+                        "type": "string",
+                        "description": "Short task title.",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Detailed task description.",
+                    },
+                },
+                "required": ["subject"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_task",
+            "description": "Return the full JSON record for one task.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task ID such as task_1234abcd.",
+                    }
+                },
+                "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_tasks",
+            "description": "List all persisted tasks with status and blockers.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_task",
+            "description": "Add dependency edges to a pending unowned task.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task to update.",
+                    },
+                    "addBlockedBy": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Dependency task IDs to add.",
+                    },
+                },
+                "required": ["task_id", "addBlockedBy"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "claim_task",
+            "description": "Claim an unblocked pending task for an owner.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task to claim.",
+                    },
+                    "owner": {
+                        "type": "string",
+                        "description": "Agent or user name claiming the task.",
+                    },
+                },
+                "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "complete_task",
+            "description": "Mark an in-progress task completed and report unblocked tasks.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task to complete.",
+                    },
+                    "owner": {
+                        "type": "string",
+                        "description": "Owner completing the task.",
+                    },
+                },
+                "required": ["task_id"],
+            },
+        },
+    },
 ]
 
 
@@ -1398,6 +1770,54 @@ def run_remember(
     return MEMORY.remember(name, type, description, body)
 
 
+def run_create_task(subject: str, description: str = "") -> str:
+    """创建一个持久化任务，并把生成的 ID 返回给模型。"""
+    task = TASKS.create(subject, description)
+    return json.dumps(asdict(task), ensure_ascii=False, indent=2)
+
+
+def run_get_task(task_id: str) -> str:
+    """返回单个任务的完整 JSON。"""
+    task = TASKS.get(task_id)
+    return json.dumps(asdict(task), ensure_ascii=False, indent=2)
+
+
+def run_list_tasks() -> str:
+    """列出全部任务的概要和阻塞情况。"""
+    tasks = TASKS.list()
+    if not tasks:
+        return "当前没有任务"
+
+    lines = []
+    for task in tasks:
+        blockers = TASKS.incomplete_dependencies(task)
+        blocked_text = (
+            f"blocked by {', '.join(blockers)}" if blockers else "unblocked"
+        )
+        owner_text = task.owner or "unowned"
+        lines.append(
+            f"- {task.id} [{task.status}] {task.subject} "
+            f"owner={owner_text}; {blocked_text}"
+        )
+    return "\n".join(lines)
+
+
+def run_update_task(task_id: str, addBlockedBy: List[str]) -> str:
+    """给任务增加依赖边。"""
+    task = TASKS.update_dependencies(task_id, addBlockedBy)
+    return json.dumps(asdict(task), ensure_ascii=False, indent=2)
+
+
+def run_claim_task(task_id: str, owner: str = "agent") -> str:
+    """认领一个可开始的任务。"""
+    return TASKS.claim(task_id, owner)
+
+
+def run_complete_task(task_id: str, owner: str = "agent") -> str:
+    """完成一个进行中的任务，并返回解锁信息。"""
+    return TASKS.complete(task_id, owner)
+
+
 TOOL_HANDLERS: Dict[str, Callable[..., str]] = {
     "bash": run_bash,
     "read_file": run_read,
@@ -1409,6 +1829,12 @@ TOOL_HANDLERS: Dict[str, Callable[..., str]] = {
     "load_skill": run_load_skill,
     "compact": run_compact,
     "remember": run_remember,
+    "create_task": run_create_task,
+    "get_task": run_get_task,
+    "list_tasks": run_list_tasks,
+    "update_task": run_update_task,
+    "claim_task": run_claim_task,
+    "complete_task": run_complete_task,
 }
 
 SUBAGENT_TOOLS = [
@@ -1474,6 +1900,24 @@ def check_permission_rules(
     tool_name: str, arguments: Dict[str, Any]
 ) -> Optional[Tuple[PermissionDecision, str]]:
     """第二关：根据工具名称和结构化参数匹配权限规则。"""
+    if tool_name in {"get_task", "claim_task", "complete_task"}:
+        task_id = arguments.get("task_id")
+        if not isinstance(task_id, str) or not TASKS.ID_PATTERN.match(task_id):
+            return PermissionDecision.DENY, "任务 ID 格式不合法"
+
+    if tool_name == "update_task":
+        task_id = arguments.get("task_id")
+        dependencies = arguments.get("addBlockedBy")
+        if not isinstance(task_id, str) or not TASKS.ID_PATTERN.match(task_id):
+            return PermissionDecision.DENY, "任务 ID 格式不合法"
+        if not isinstance(dependencies, list):
+            return PermissionDecision.DENY, "addBlockedBy 必须是列表"
+        for dependency_id in dependencies:
+            if not isinstance(dependency_id, str):
+                return PermissionDecision.DENY, "依赖任务 ID 必须是字符串"
+            if not TASKS.ID_PATTERN.match(dependency_id):
+                return PermissionDecision.DENY, "依赖任务 ID 格式不合法"
+
     if tool_name in {"read_file", "write_file", "edit_file"}:
         path = arguments.get("path")
         if not isinstance(path, str) or path_is_outside_workspace(path):
