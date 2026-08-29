@@ -66,12 +66,24 @@ Coding Agent（输入 exit 退出）
 >
 ```
 
+如果需要录制演示视频，可以使用更清爽的演示模式：
+
+```bash
+python main.py --demo
+```
+
+演示模式不会改变 Agent 的真实执行逻辑，只会把工具调用、Hook 和测试结果压缩成更容易观看的终端摘要。调试时可以使用：
+
+```bash
+python main.py --verbose
+```
+
 ## 示例任务
 
 可以输入：
 
 ```text
-/goal 创建 demo_math.py 和 demo_test.py，实现 add(a, b) 函数，并运行 python demo_test.py，直到测试通过且退出码为 0
+/goal 在 demo_workspace/calculator_demo 目录下创建 calculator.py 和 test_calculator.py，实现 add、subtract、multiply 三个函数，并运行 python demo_workspace/calculator_demo/test_calculator.py，直到测试全部通过且退出码为 0
 ```
 
 这个示例会展示：

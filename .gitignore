@@ -3,6 +3,7 @@
 __pycache__/
 *.py[cod]
 test/
+demo_workspace/
 .task_outputs/
 .transcripts/
 .memory/

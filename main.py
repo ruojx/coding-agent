@@ -1,5 +1,6 @@
 """编程智能体的第十七个版本：增加 Goal Loop 完成条件判断。"""
 
+import argparse
 import ast
 import datetime as dt
 import hashlib
@@ -32,6 +33,7 @@ TASKS_DIR = WORKDIR / ".tasks"
 SCHEDULE_FILE = WORKDIR / ".scheduled_tasks.json"
 MAILBOX_DIR = WORKDIR / ".mailboxes"
 WORKFLOW_DIR = WORKDIR / ".workflows"
+DISPLAY_MODE = "normal"
 
 BASE_SYSTEM_PROMPT = (
     f"You are Coding Agent, a local coding agent powered by DeepSeek. "
@@ -80,6 +82,199 @@ BASE_SUBAGENT_SYSTEM_PROMPT = (
     "Your intermediate tool calls stay in your own context; "
     "only your final summary returns to the parent agent."
 )
+
+
+def set_display_mode(mode: str) -> None:
+    """设置终端展示模式：normal、demo 或 verbose。"""
+    global DISPLAY_MODE
+    if mode not in {"normal", "demo", "verbose"}:
+        raise ValueError(f"未知展示模式：{mode}")
+    DISPLAY_MODE = mode
+
+
+def is_demo_mode() -> bool:
+    """判断当前是否处于适合录视频的演示模式。"""
+    return DISPLAY_MODE == "demo"
+
+
+def is_verbose_mode() -> bool:
+    """判断当前是否处于完整调试日志模式。"""
+    return DISPLAY_MODE == "verbose"
+
+
+def shorten_text(text: str, limit: int = 120) -> str:
+    """把长文本压缩成单行摘要，避免终端被参数刷屏。"""
+    one_line = " ".join(str(text).split())
+    if len(one_line) <= limit:
+        return one_line
+    return one_line[:limit] + "……"
+
+
+def tool_target(tool_name: str, arguments: Dict[str, Any]) -> str:
+    """根据工具类型提取最适合展示的目标。"""
+    if tool_name in {"read_file", "write_file", "edit_file"}:
+        return str(arguments.get("path", ""))
+    if tool_name == "bash":
+        return str(arguments.get("command", ""))
+    if tool_name == "glob":
+        return str(arguments.get("pattern", ""))
+    if tool_name == "load_skill":
+        return str(arguments.get("name", ""))
+    if tool_name == "run_workflow":
+        return str(arguments.get("name", ""))
+    if tool_name == "connect_mcp":
+        return str(arguments.get("name", ""))
+    if tool_name == "schedule_cron":
+        return str(arguments.get("cron", ""))
+    return ""
+
+
+def describe_file_purpose(path_text: str) -> str:
+    """根据文件名推断演示时更容易理解的中文用途。"""
+    name = Path(path_text).name.lower()
+    if name in {"readme.md", "readme.txt"}:
+        return "项目说明文档"
+    if name.startswith("test_") or name.endswith("_test.py"):
+        return "单元测试代码"
+    if name.endswith(".log"):
+        return "示例日志数据"
+    if name == "main.py":
+        return "命令行入口程序"
+    if "analyzer" in name:
+        return "日志分析核心模块"
+    if name.endswith(".py"):
+        return "Python 功能模块"
+    return "项目文件"
+
+
+def describe_command_purpose(command: str) -> str:
+    """把 Shell 命令翻译成演示时可读的中文动作。"""
+    lowered = command.lower()
+    if "unittest" in lowered or "pytest" in lowered or " test" in lowered:
+        return "运行单元测试，检查功能是否通过"
+    if "python" in lowered and ".py" in lowered:
+        return "运行命令行工具，验证真实使用效果"
+    if "ls" in lowered or "find" in lowered:
+        return "检查当前目录和已生成文件"
+    if "python" in lowered and "--version" in lowered:
+        return "检查本地 Python 运行环境"
+    return "执行本地验证命令"
+
+
+def display_tool_request(
+    agent_name: str, tool_name: str, arguments: Dict[str, Any]
+) -> None:
+    """展示模型即将调用的工具；演示模式只显示人能看懂的摘要。"""
+    if is_demo_mode():
+        target = shorten_text(tool_target(tool_name, arguments), 90)
+        if tool_name == "todo_write":
+            print("\n📋 Agent 正在整理开发计划")
+        elif tool_name == "bash":
+            purpose = describe_command_purpose(str(arguments.get("command", "")))
+            print(f"\n🧪 {purpose}")
+            print(f"   命令：{target}")
+        elif tool_name == "write_file":
+            purpose = describe_file_purpose(str(arguments.get("path", "")))
+            print(f"\n📝 Agent 正在创建{purpose}")
+            print(f"   文件：{target}")
+        elif tool_name == "edit_file":
+            purpose = describe_file_purpose(str(arguments.get("path", "")))
+            print(f"\n✏️ Agent 正在修正{purpose}")
+            print(f"   文件：{target}")
+        elif tool_name == "read_file":
+            purpose = describe_file_purpose(str(arguments.get("path", "")))
+            print(f"\n📖 Agent 正在查看{purpose}")
+            print(f"   文件：{target}")
+        elif tool_name == "glob":
+            print("\n🔎 Agent 正在了解项目里有哪些文件")
+            print(f"   匹配：{target}")
+        else:
+            suffix = f"：{target}" if target else ""
+            print(f"\n🛠 Agent 正在使用扩展能力：{tool_name}{suffix}")
+        return
+
+    if tool_name == "bash":
+        command = arguments["command"]
+        print(f"[{agent_name} 请求 bash] $ {command}")
+    else:
+        print(f"[{agent_name} 请求 {tool_name}]")
+
+
+def summarize_bash_output(output: str) -> str:
+    """为演示模式提取命令输出中的关键信息。"""
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    exit_line = next(
+        (line for line in lines if line.startswith("(exit_code=")),
+        None,
+    )
+    explicit_exit = next(
+        (line for line in lines if line.startswith("EXIT_CODE=")),
+        None,
+    )
+    explicit_exit_code = None
+    if explicit_exit:
+        try:
+            explicit_exit_code = int(explicit_exit.split("=", 1)[1])
+        except ValueError:
+            explicit_exit_code = None
+    ok_lines = [
+        line for line in lines
+        if line == "OK" or line.startswith("Ran ") or line.endswith(" ok")
+    ]
+
+    ok_without_explicit_exit = (
+        explicit_exit_code is None
+        and explicit_exit is None
+        and exit_line is None
+        and "OK" in lines
+    )
+    if explicit_exit_code == 0 or ok_without_explicit_exit:
+        summary = "✅ 验证通过"
+    elif explicit_exit_code is not None:
+        summary = (
+            f"❌ 验证失败：退出码 {explicit_exit_code}。"
+            "Agent 会根据结果继续修复。"
+        )
+    elif exit_line:
+        summary = f"❌ 验证失败：{exit_line}。Agent 会根据结果继续修复。"
+    else:
+        summary = "✅ 命令已完成"
+
+    details = ok_lines[-4:]
+    if explicit_exit:
+        details.append(explicit_exit)
+    if details:
+        return summary + "\n" + "\n".join(details)
+    return summary
+
+
+def display_tool_result(
+    tool_name: str, arguments: Dict[str, Any], result: str
+) -> None:
+    """展示工具执行结果；演示模式隐藏大段源码和长命令输出。"""
+    if not is_demo_mode():
+        print(result)
+        return
+
+    target = shorten_text(tool_target(tool_name, arguments), 90)
+    if tool_name == "todo_write":
+        print(result)
+    elif tool_name == "write_file":
+        purpose = describe_file_purpose(str(arguments.get("path", "")))
+        print(f"✅ 已完成：{purpose}已创建")
+    elif tool_name == "edit_file":
+        purpose = describe_file_purpose(str(arguments.get("path", "")))
+        print(f"✅ 已完成：{purpose}已修正")
+    elif tool_name == "read_file":
+        purpose = describe_file_purpose(str(arguments.get("path", "")))
+        print(f"✅ 已了解：{purpose}，继续决定下一步")
+    elif tool_name == "glob":
+        count = 0 if result == "（没有匹配项）" else len(result.splitlines())
+        print(f"✅ 已找到 {count} 个相关文件或目录")
+    elif tool_name == "bash":
+        print(summarize_bash_output(result))
+    else:
+        print(f"✅ {tool_name} 完成：{shorten_text(result, 160)}")
 
 
 class SkillLoader:
@@ -291,7 +486,7 @@ class ContextCompactor:
     CONTEXT_CHAR_LIMIT = 50_000
     TARGET_CHAR_LIMIT = 40_000
     MAX_MESSAGES = 50
-    KEEP_HEAD_MESSAGES = 3
+    KEEP_HEAD_MESSAGES = 1
     KEEP_TAIL_MESSAGES = 46
     KEEP_RECENT_TOOL_RESULTS = 3
     LARGE_RESULT_CHAR_LIMIT = 30_000
@@ -402,7 +597,8 @@ class ContextCompactor:
                 f"完整记录保存在 {transcript}"
             ),
         }
-        print(f"[compact] 已归档旧消息：{transcript}")
+        if not is_demo_mode():
+            print(f"[compact] 已归档旧消息：{transcript}")
         return [*messages[:head_end], marker, *messages[tail_start:]]
 
     def micro_compact(
@@ -843,7 +1039,8 @@ class MemoryStore:
                 candidate["body"],
             )
             if result.startswith("已保存记忆"):
-                print(f"[memory] {result}")
+                if not is_demo_mode():
+                    print(f"[memory] {result}")
                 changed = True
         if changed and len(self.catalog()) >= self.CONSOLIDATE_THRESHOLD:
             self.consolidate(client)
@@ -953,7 +1150,8 @@ class MemoryStore:
             json.dumps(valid, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        print(f"[memory] 已生成记忆合并建议：{self.display_path(path)}")
+        if not is_demo_mode():
+            print(f"[memory] 已生成记忆合并建议：{self.display_path(path)}")
 
     def should_store_consolidated(self, record: Dict[str, Any]) -> bool:
         """校验模型合并后的记忆记录。"""
@@ -3627,11 +3825,21 @@ class GoalController:
             print(self.clear())
             return ""
 
-        print(self.set(condition))
+        status = self.set(condition)
+        if is_demo_mode():
+            print(f"🎯 Goal 已设置：{condition}")
+        else:
+            print(status)
+        final_style = (
+            "最终回答请不超过五行，只列出创建的文件、验证命令和测试结果。"
+            if is_demo_mode()
+            else ""
+        )
         return (
             f"[Goal]\n{condition}\n\n"
             "请开始完成这个目标。每次运行验证命令后，明确写出命令、"
             "关键输出和退出码，方便独立 Goal 判断器检查。"
+            f"{final_style}"
         )
 
     def evaluate_after_turn(
@@ -3656,10 +3864,14 @@ class GoalController:
 
         if decision.action == "allow":
             self.state.active = False
+            if is_demo_mode():
+                print(f"\n🏁 Goal Loop 验收通过：{decision.reason}")
             return None
 
         if decision.action == "block":
             self.state.blocks += 1
+            if is_demo_mode():
+                print(f"\n🔁 Goal Loop 要求继续：{decision.reason}")
             if self.state.blocks > self.max_blocks:
                 return (
                     "<goal_blocked>Goal 还没有被证明完成，但自动继续次数"
@@ -3687,9 +3899,7 @@ GOAL = GoalController(PromptGoalEvaluator())
 
 def run_todo_write(todos: Any) -> str:
     """更新当前任务计划；这个工具只负责规划，不直接修改文件。"""
-    output = TODO.update(todos)
-    print(output)
-    return output
+    return TODO.update(todos)
 
 
 def run_task(prompt: str) -> str:
@@ -4169,7 +4379,10 @@ def trigger_hooks(event: str, *args: Any) -> Optional[str]:
 
 def prompt_context_hook(query: str) -> None:
     """UserPromptSubmit：显示本次请求使用的工作目录。"""
-    print(f"[Hook:UserPromptSubmit] 工作目录：{WORKDIR}")
+    if is_demo_mode():
+        print(f"📁 工作目录：{WORKDIR}")
+    else:
+        print(f"[Hook:UserPromptSubmit] 工作目录：{WORKDIR}")
     return None
 
 
@@ -4183,9 +4396,12 @@ def permission_hook(
 
 def tool_log_hook(tool_name: str, arguments: Dict[str, Any]) -> None:
     """PreToolUse：记录即将执行的工具及参数摘要。"""
+    if is_demo_mode():
+        return None
     arguments_text = json.dumps(arguments, ensure_ascii=False)
-    if len(arguments_text) > 120:
-        arguments_text = arguments_text[:120] + "……"
+    limit = 500 if is_verbose_mode() else 120
+    if len(arguments_text) > limit:
+        arguments_text = arguments_text[:limit] + "……"
     print(f"[Hook:PreToolUse] {tool_name} {arguments_text}")
     return None
 
@@ -4205,6 +4421,8 @@ def large_output_hook(
 
 def stop_summary_hook(messages: List[Dict[str, Any]]) -> None:
     """Stop：在 Agent 即将结束时统计当前会话的工具结果数。"""
+    if is_demo_mode():
+        return None
     tool_count = sum(
         1 for message in messages if message.get("role") == "tool"
     )
@@ -4333,6 +4551,8 @@ def agent_loop(
         messages[:] = prepare_runtime_context(
             client, messages, active_request, agent_name
         )
+        if is_demo_mode():
+            print("\n🤖 Agent 正在根据当前结果决定下一步...")
         response = call_model_with_recovery(
             client, messages, current_tools, active_request
         )
@@ -4348,7 +4568,7 @@ def agent_loop(
             final_text = assistant_message.content or ""
             if print_final:
                 print(final_text)
-            if extract_memory:
+            if extract_memory and not is_demo_mode():
                 MEMORY.extract_after_turn(client, messages)
             return final_text
 
@@ -4356,16 +4576,13 @@ def agent_loop(
         compact_requested = False
         for tool_call in assistant_message.tool_calls:
             tool_name = tool_call.function.name
+            arguments: Dict[str, Any] = {}
             try:
                 arguments = json.loads(tool_call.function.arguments)
                 if not isinstance(arguments, dict):
                     raise TypeError("工具参数必须是 JSON 对象")
 
-                if tool_name == "bash":
-                    command = arguments["command"]
-                    print(f"[{agent_name} 请求 bash] $ {command}")
-                else:
-                    print(f"[{agent_name} 请求 {tool_name}]")
+                display_tool_request(agent_name, tool_name, arguments)
                 if tool_name == "todo_write":
                     used_todo = True
                 if tool_name == "compact":
@@ -4386,7 +4603,7 @@ def agent_loop(
             except (json.JSONDecodeError, KeyError, TypeError) as exc:
                 result = f"错误：工具参数无效：{exc}"
 
-            print(result)
+            display_tool_result(tool_name, arguments, result)
 
             messages.append(
                 {
@@ -4447,8 +4664,33 @@ def run_subagent(client: OpenAI, prompt: str) -> str:
     return final_text or "子 Agent 没有返回总结"
 
 
+def parse_args() -> argparse.Namespace:
+    """解析命令行参数，用于切换演示和调试展示模式。"""
+    parser = argparse.ArgumentParser(
+        description="从零实现的命令行 Coding Agent"
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--demo",
+        action="store_true",
+        help="开启演示模式，只显示关键步骤，适合录制两分钟视频",
+    )
+    mode.add_argument(
+        "--verbose",
+        action="store_true",
+        help="开启完整调试模式，显示更详细的工具和 Hook 信息",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
     global ACTIVE_CLIENT
+
+    args = parse_args()
+    if args.demo:
+        set_display_mode("demo")
+    elif args.verbose:
+        set_display_mode("verbose")
 
     api_key = os.getenv("DEEPSEEK_API_KEY")
     if not api_key:
@@ -4460,7 +4702,13 @@ def main() -> None:
         {"role": "system", "content": build_system_prompt()}
     ]
 
-    print("Coding Agent（输入 exit 退出）")
+    if is_demo_mode():
+        print("Coding Agent 演示模式（输入 exit 退出）")
+        print("提示：推荐使用 /goal 输入一个需要真实完成的编程目标。")
+    elif is_verbose_mode():
+        print("Coding Agent 调试模式（输入 exit 退出）")
+    else:
+        print("Coding Agent（输入 exit 退出）")
     while True:
         try:
             query = input("> ").strip()
