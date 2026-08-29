@@ -1,4 +1,4 @@
-"""编程智能体的第十三个版本：增加 Agent Teams 团队运行时。"""
+"""编程智能体的第十四个版本：增加 MCP Plugin 动态工具接入。"""
 
 import ast
 import datetime as dt
@@ -55,6 +55,8 @@ BASE_SYSTEM_PROMPT = (
     "and the agent loop decides which tools to call when the prompt arrives. "
     "When parallel work would help, propose a small teammate plan first and "
     "wait for the user's confirmation before calling spawn_teammate. "
+    "Use connect_mcp to connect external tool servers before calling their "
+    "dynamically discovered mcp__server__tool functions. "
     "Tool calls may be denied by the local permission system. "
     "If a call is denied, do not claim it succeeded; choose a safer approach. "
     "When the task is complete, answer the user directly."
@@ -1944,6 +1946,259 @@ class TeamRuntime:
 
 TEAM = TeamRuntime(BUS)
 
+
+class MCPClient:
+    """一个已连接的 MCP server 代理：保存工具定义并路由调用。"""
+
+    def __init__(
+        self,
+        name: str,
+        tools: List[Dict[str, Any]],
+        handlers: Dict[str, Callable[..., str]],
+    ) -> None:
+        self.name = name
+        self.tools = tools
+        self.handlers = handlers
+
+    def prefixed_tools(self) -> List[Dict[str, Any]]:
+        """把 server 内部工具名改成 mcp__server__tool，避免重名。"""
+        prefixed = []
+        for tool in self.tools:
+            copied = json.loads(json.dumps(tool))
+            original_name = copied["function"]["name"]
+            copied["function"]["name"] = self.prefixed_name(original_name)
+            copied["function"]["description"] = (
+                f"[MCP:{self.name}] "
+                + copied["function"].get("description", "")
+            )
+            prefixed.append(copied)
+        return prefixed
+
+    def call(self, tool_name: str, arguments: Dict[str, Any]) -> str:
+        """调用 server 内部工具。"""
+        handler = self.handlers.get(tool_name)
+        if handler is None:
+            raise ValueError(f"MCP 工具不存在：{self.name}.{tool_name}")
+        return handler(**arguments)
+
+    def prefixed_name(self, tool_name: str) -> str:
+        """生成外部工具在模型侧看到的名字。"""
+        return f"mcp__{self.name}__{tool_name}"
+
+
+class MCPRegistry:
+    """管理 MCP server：连接、发现工具、执行动态工具。"""
+
+    SERVER_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
+    TOOL_PATTERN = re.compile(r"^mcp__([a-z][a-z0-9_-]{1,31})__(.+)$")
+
+    def __init__(self) -> None:
+        self.clients: Dict[str, MCPClient] = {}
+        self.available_servers = self.build_available_servers()
+        self.policies = {
+            "docs.search": "allow",
+            "docs.get_version": "allow",
+            "deploy.status": "allow",
+            "deploy.trigger": "ask",
+        }
+
+    def connect(self, name: str) -> str:
+        """连接一个外部工具 server，并把它的工具加入动态工具池。"""
+        self.validate_server_name(name)
+        if name in self.clients:
+            return f"MCP server already connected: {name}"
+
+        factory = self.available_servers.get(name)
+        if factory is None:
+            known = ", ".join(sorted(self.available_servers))
+            raise ValueError(f"未知 MCP server：{name}；可用：{known}")
+
+        self.clients[name] = factory()
+        tool_names = [
+            tool["function"]["name"]
+            for tool in self.clients[name].tools
+        ]
+        return (
+            f"Connected MCP server {name}; discovered tools: "
+            + ", ".join(tool_names)
+        )
+
+    def list_servers(self) -> str:
+        """列出可连接和已连接的 MCP server。"""
+        lines = []
+        for name in sorted(self.available_servers):
+            state = "connected" if name in self.clients else "available"
+            lines.append(f"- {name}: {state}")
+        return "\n".join(lines) if lines else "当前没有可用 MCP server"
+
+    def dynamic_tools(self) -> List[Dict[str, Any]]:
+        """返回所有已连接 server 的动态工具定义。"""
+        tools = []
+        for client in self.clients.values():
+            tools.extend(client.prefixed_tools())
+        return tools
+
+    def call(self, name: str, arguments: Dict[str, Any]) -> str:
+        """执行 mcp__server__tool 形式的动态工具。"""
+        server, tool = self.split_tool_name(name)
+        client = self.clients.get(server)
+        if client is None:
+            raise ValueError(f"MCP server 尚未连接：{server}")
+        return client.call(tool, arguments)
+
+    def policy_for(self, name: str) -> "PermissionDecision":
+        """宿主侧 MCP 权限策略；未知外部工具默认需要确认。"""
+        server, tool = self.split_tool_name(name)
+        return PermissionDecision(
+            self.policies.get(f"{server}.{tool}", "ask")
+        )
+
+    def is_mcp_tool(self, name: str) -> bool:
+        """判断工具名是否是动态 MCP 工具。"""
+        return isinstance(name, str) and self.TOOL_PATTERN.match(name) is not None
+
+    def split_tool_name(self, name: str) -> Tuple[str, str]:
+        """把 mcp__server__tool 拆成 server 和 tool。"""
+        if not isinstance(name, str):
+            raise ValueError("MCP 工具名必须是字符串")
+        match = self.TOOL_PATTERN.match(name)
+        if match is None:
+            raise ValueError(f"MCP 工具名不合法：{name}")
+        server, tool = match.groups()
+        if not tool:
+            raise ValueError(f"MCP 工具名不合法：{name}")
+        return server, tool
+
+    def validate_server_name(self, name: str) -> None:
+        """限制 server 名称，避免动态工具名前缀混乱。"""
+        if not isinstance(name, str) or not self.SERVER_PATTERN.match(name):
+            raise ValueError(f"MCP server 名称不合法：{name}")
+
+    def build_available_servers(
+        self,
+    ) -> Dict[str, Callable[[], MCPClient]]:
+        """构造本地模拟 server，用来演示 MCP 动态工具协议。"""
+        return {
+            "docs": self.build_docs_server,
+            "deploy": self.build_deploy_server,
+        }
+
+    def build_docs_server(self) -> MCPClient:
+        """模拟文档检索 server。"""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "description": "Search built-in agent documentation notes.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Search query.",
+                            }
+                        },
+                        "required": ["query"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_version",
+                    "description": "Return the mock docs server version.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        ]
+        handlers = {
+            "search": self.docs_search,
+            "get_version": lambda: "docs-server mock version 1.0",
+        }
+        return MCPClient("docs", tools, handlers)
+
+    def build_deploy_server(self) -> MCPClient:
+        """模拟部署 server，用来展示外部高风险工具需要确认。"""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "status",
+                    "description": "Check deployment status for a service.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "service": {
+                                "type": "string",
+                                "description": "Service name.",
+                            }
+                        },
+                        "required": ["service"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "trigger",
+                    "description": "Trigger a mock deployment for a service.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "service": {
+                                "type": "string",
+                                "description": "Service name.",
+                            }
+                        },
+                        "required": ["service"],
+                    },
+                },
+            },
+        ]
+        handlers = {
+            "status": lambda service: f"{service}: mock deployment is healthy",
+            "trigger": lambda service: (
+                f"{service}: mock deployment trigger accepted"
+            ),
+        }
+        return MCPClient("deploy", tools, handlers)
+
+    def docs_search(self, query: str) -> str:
+        """模拟检索固定文档片段。"""
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("query 不能为空")
+        notes = [
+            "Hooks run before and after tool calls.",
+            "Background tasks return bg_id before command completion.",
+            "Cron scheduler delivers prompts instead of running bash directly.",
+            "Agent teams communicate through isolated mailboxes.",
+            "MCP tools are discovered dynamically after connect_mcp.",
+        ]
+        lowered = query.lower()
+        hits = [note for note in notes if lowered in note.lower()]
+        if not hits:
+            hits = notes[:3]
+        return "\n".join(f"- {hit}" for hit in hits)
+
+
+MCP = MCPRegistry()
+
+
+def assemble_tool_pool(
+    base_tools: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """每轮动态组装本地工具 + 已连接 MCP 工具。"""
+    tools = TOOLS if base_tools is None else base_tools
+    return [*tools, *MCP.dynamic_tools()]
+
+
+def assemble_tool_handlers(
+    base_handlers: Optional[Dict[str, Callable[..., str]]] = None,
+) -> Dict[str, Callable[..., str]]:
+    """返回工具处理器；MCP 工具在 execute_tool 中动态路由。"""
+    return TOOL_HANDLERS if base_handlers is None else base_handlers
+
 TOOLS = [
     {
         "type": "function",
@@ -2178,6 +2433,35 @@ TOOLS = [
                 },
                 "required": ["name", "type", "description", "body"],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "connect_mcp",
+            "description": (
+                "Connect an external MCP-style tool server. After connection, "
+                "its tools appear as mcp__server__tool functions in the next "
+                "model round."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Server name, such as docs or deploy.",
+                    }
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_mcp_servers",
+            "description": "List available and connected MCP-style servers.",
+            "parameters": {"type": "object", "properties": {}},
         },
     },
     {
@@ -2708,6 +2992,16 @@ def run_remember(
     return MEMORY.remember(name, type, description, body)
 
 
+def run_connect_mcp(name: str) -> str:
+    """连接一个 MCP-style 外部工具服务。"""
+    return MCP.connect(name)
+
+
+def run_list_mcp_servers() -> str:
+    """列出可用和已连接的 MCP-style 服务。"""
+    return MCP.list_servers()
+
+
 def run_create_task(subject: str, description: str = "") -> str:
     """创建一个持久化任务，并把生成的 ID 返回给模型。"""
     task = TASKS.create(subject, description)
@@ -2824,6 +3118,8 @@ TOOL_HANDLERS: Dict[str, Callable[..., str]] = {
     "load_skill": run_load_skill,
     "compact": run_compact,
     "remember": run_remember,
+    "connect_mcp": run_connect_mcp,
+    "list_mcp_servers": run_list_mcp_servers,
     "create_task": run_create_task,
     "get_task": run_get_task,
     "list_tasks": run_list_tasks,
@@ -2912,6 +3208,24 @@ def check_permission_rules(
     tool_name: str, arguments: Dict[str, Any]
 ) -> Optional[Tuple[PermissionDecision, str]]:
     """第二关：根据工具名称和结构化参数匹配权限规则。"""
+    if tool_name == "connect_mcp":
+        name = arguments.get("name")
+        try:
+            MCP.validate_server_name(name)
+        except ValueError as exc:
+            return PermissionDecision.DENY, str(exc)
+
+    if MCP.is_mcp_tool(tool_name):
+        try:
+            policy = MCP.policy_for(tool_name)
+        except ValueError as exc:
+            return PermissionDecision.DENY, str(exc)
+        if policy == PermissionDecision.ALLOW:
+            return PermissionDecision.ALLOW, "MCP 只读或低风险工具"
+        if policy == PermissionDecision.DENY:
+            return PermissionDecision.DENY, "MCP 工具被宿主策略禁止"
+        return PermissionDecision.ASK, "MCP 外部工具需要确认"
+
     if tool_name in {"get_task", "claim_task", "complete_task"}:
         task_id = arguments.get("task_id")
         if not isinstance(task_id, str) or not TASKS.ID_PATTERN.match(task_id):
@@ -3145,6 +3459,12 @@ def execute_tool(
     handlers: Dict[str, Callable[..., str]],
 ) -> str:
     """根据工具名称查找处理函数，并统一返回执行结果。"""
+    if MCP.is_mcp_tool(name):
+        try:
+            return MCP.call(name, arguments)
+        except (OSError, UnicodeError, TypeError, ValueError) as exc:
+            return f"错误：{exc}"
+
     handler = handlers.get(name)
     if handler is None:
         return f"错误：未知工具 {name}"
@@ -3173,12 +3493,14 @@ def agent_loop(
     extract_memory: bool = False,
 ) -> str:
     """持续调用模型，直到模型不再请求使用工具。"""
-    tools = TOOLS if tools is None else tools
-    handlers = TOOL_HANDLERS if handlers is None else handlers
+    base_tools = tools
+    base_handlers = handlers
     rounds_since_todo = 0
     reactive_retries = 0
 
     for _step in range(max_steps):
+        current_tools = assemble_tool_pool(base_tools)
+        current_handlers = assemble_tool_handlers(base_handlers)
         inject_background_results(messages)
         inject_scheduled_prompts(messages)
         if agent_name == "Agent":
@@ -3188,7 +3510,7 @@ def agent_loop(
             response = client.chat.completions.create(
                 model=MODEL,
                 messages=messages,
-                tools=tools,
+                tools=current_tools,
                 tool_choice="auto",
             )
             reactive_retries = 0
@@ -3245,7 +3567,9 @@ def agent_loop(
                     "PreToolUse", tool_name, arguments
                 )
                 if blocked is None:
-                    result = execute_tool(tool_name, arguments, handlers)
+                    result = execute_tool(
+                        tool_name, arguments, current_handlers
+                    )
                     trigger_hooks(
                         "PostToolUse", tool_name, arguments, result
                     )
