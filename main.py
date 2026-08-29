@@ -1,4 +1,4 @@
-"""编程智能体的第十五个版本：把多种机制集成进同一个 Agent Loop。"""
+"""编程智能体的第十六个版本：增加 Workflow Runtime。"""
 
 import ast
 import datetime as dt
@@ -31,6 +31,7 @@ MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 TASKS_DIR = WORKDIR / ".tasks"
 SCHEDULE_FILE = WORKDIR / ".scheduled_tasks.json"
 MAILBOX_DIR = WORKDIR / ".mailboxes"
+WORKFLOW_DIR = WORKDIR / ".workflows"
 
 BASE_SYSTEM_PROMPT = (
     f"You are Coding Agent, a local coding agent powered by DeepSeek. "
@@ -60,6 +61,8 @@ BASE_SYSTEM_PROMPT = (
     "All runtime mechanisms are integrated into one loop: notifications, "
     "memory, skills, context compaction, MCP tools, permissions, hooks, and "
     "tool results must flow through the same message pipeline. "
+    "Use run_workflow for fixed multi-step procedures where host-side code "
+    "should orchestrate phases, retries, journaled steps, and resume. "
     "Tool calls may be denied by the local permission system. "
     "If a call is denied, do not claim it succeeded; choose a safer approach. "
     "When the task is complete, answer the user directly."
@@ -220,6 +223,12 @@ def runtime_status_summary() -> str:
         sections.append(f"- MCP servers:\n{MCP.list_servers()}")
     except Exception:
         sections.append("- MCP servers: unavailable")
+
+    try:
+        workflow_count = len(WORKFLOWS.workflows)
+        sections.append(f"- workflows: {workflow_count} registered")
+    except Exception:
+        sections.append("- workflows: unavailable")
 
     return "\n".join(sections)
 
@@ -2232,6 +2241,394 @@ class MCPRegistry:
 MCP = MCPRegistry()
 
 
+@dataclass
+class WorkflowDefinition:
+    """宿主侧预先注册的工作流定义。"""
+
+    name: str
+    description: str
+    phases: List[str]
+    handler: Callable[["ExecutionState", Dict[str, Any]], Dict[str, Any]]
+
+
+class WorkflowJournal:
+    """工作流运行日志：每一步结果追加写入 JSONL，用于恢复执行。"""
+
+    def __init__(self, workflow_dir: Path, run_id: str) -> None:
+        self.workflow_dir = workflow_dir
+        self.run_id = run_id
+        self.path = workflow_dir / f"{run_id}.journal.jsonl"
+        self.records: Dict[str, Any] = {}
+        self.load()
+
+    def load(self) -> None:
+        """从已有 journal 恢复已完成步骤。"""
+        if not self.path.exists():
+            return
+        try:
+            for line in self.path.read_text(encoding="utf-8").splitlines():
+                data = json.loads(line)
+                key = data.get("key")
+                if isinstance(key, str):
+                    self.records[key] = data.get("value")
+        except (OSError, json.JSONDecodeError):
+            self.records = {}
+
+    def get(self, key: str) -> Any:
+        """读取已缓存步骤。"""
+        return self.records.get(key)
+
+    def has(self, key: str) -> bool:
+        """判断某个稳定 key 是否已经完成。"""
+        return key in self.records
+
+    def append(self, key: str, value: Any) -> None:
+        """追加一步结果；不覆盖、不删除历史。"""
+        self.workflow_dir.mkdir(parents=True, exist_ok=True)
+        record = {
+            "key": key,
+            "value": value,
+            "created_at": dt.datetime.now().isoformat(timespec="seconds"),
+        }
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self.records[key] = value
+
+
+class ExecutionState:
+    """Workflow 脚本使用的编排上下文。"""
+
+    def __init__(
+        self,
+        runtime: "WorkflowRuntime",
+        run_id: str,
+        workflow_name: str,
+        args: Dict[str, Any],
+        journal: WorkflowJournal,
+    ) -> None:
+        self.runtime = runtime
+        self.run_id = run_id
+        self.workflow_name = workflow_name
+        self.args = args
+        self.journal = journal
+        self.current_phase = "init"
+        self.events: List[str] = []
+
+    def phase(self, title: str) -> None:
+        """切换阶段，并写入 journal。"""
+        self.current_phase = title
+        self.log(f"phase: {title}")
+
+    def log(self, message: str) -> None:
+        """记录 workflow 进度事件。"""
+        event = (
+            f"{dt.datetime.now().isoformat(timespec='seconds')} "
+            f"[{self.current_phase}] {message}"
+        )
+        self.events.append(event)
+        key = self.stable_key("log", event)
+        if not self.journal.has(key):
+            self.journal.append(key, event)
+
+    def agent(
+        self,
+        prompt: str,
+        schema: Optional[Dict[str, Any]] = None,
+        label: str = "agent",
+        phase: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """调用一次子 Agent，并用稳定 key 缓存结果。"""
+        if phase:
+            self.phase(phase)
+        key = self.stable_key(
+            "agent",
+            {"label": label, "prompt": prompt, "schema": schema},
+        )
+        if self.journal.has(key):
+            return self.journal.get(key)
+
+        if ACTIVE_CLIENT is None:
+            result: Dict[str, Any] = {
+                "text": "错误：模型客户端尚未初始化，workflow 无法调用子 Agent"
+            }
+        else:
+            text = run_subagent(ACTIVE_CLIENT, prompt)
+            result = self.coerce_agent_result(text, schema)
+
+        self.journal.append(key, result)
+        return result
+
+    def parallel(
+        self,
+        thunks: List[Callable[[], Any]],
+        label: str = "parallel",
+    ) -> List[Any]:
+        """并行执行多个宿主侧 thunk，并按输入顺序返回结果。"""
+        key = self.stable_key("parallel", {"label": label, "count": len(thunks)})
+        if self.journal.has(key):
+            return self.journal.get(key)
+
+        results: List[Any] = [None] * len(thunks)
+        errors: List[Optional[str]] = [None] * len(thunks)
+
+        def run_one(index: int, thunk: Callable[[], Any]) -> None:
+            try:
+                results[index] = thunk()
+            except Exception as exc:
+                errors[index] = str(exc)
+
+        threads = [
+            threading.Thread(target=run_one, args=(index, thunk), daemon=True)
+            for index, thunk in enumerate(thunks)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        combined = [
+            {"ok": error is None, "value": result, "error": error}
+            for result, error in zip(results, errors)
+        ]
+        self.journal.append(key, combined)
+        return combined
+
+    def pipeline(self, items: List[Any], *stages: Callable[[Any], Any]) -> List[Any]:
+        """让每个 item 依次通过多个阶段函数。"""
+        outputs = []
+        for item in items:
+            value = item
+            for stage in stages:
+                value = stage(value)
+            outputs.append(value)
+        return outputs
+
+    def workflow(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        """在 workflow 内部调用另一个已注册 workflow。"""
+        return self.runtime.run(name, args)
+
+    def coerce_agent_result(
+        self, text: str, schema: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """把子 Agent 文本结果尽量转成结构化对象。"""
+        if schema is None:
+            return {"text": text}
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return {
+                "text": text,
+                "schema_error": "子 Agent 没有返回合法 JSON",
+            }
+        if not isinstance(parsed, dict):
+            return {
+                "text": text,
+                "schema_error": "子 Agent JSON 结果不是对象",
+            }
+        return parsed
+
+    def stable_key(self, kind: str, payload: Any) -> str:
+        """根据 kind 和参数生成稳定 key，用于断点续跑。"""
+        text = json.dumps(
+            {
+                "workflow": self.workflow_name,
+                "run_id": self.run_id,
+                "kind": kind,
+                "payload": payload,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+        return f"{kind}_{digest}"
+
+
+class WorkflowRuntime:
+    """管理 workflow 注册、运行、journal 和 resume。"""
+
+    NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{1,63}$")
+    RUN_PATTERN = re.compile(r"^wf_[0-9a-f]{8}$")
+
+    def __init__(self, workflow_dir: Path) -> None:
+        self.workflow_dir = workflow_dir
+        self.workflows: Dict[str, WorkflowDefinition] = {}
+        self.register_builtin_workflows()
+
+    def register(
+        self,
+        name: str,
+        description: str,
+        phases: List[str],
+        handler: Callable[[ExecutionState, Dict[str, Any]], Dict[str, Any]],
+    ) -> None:
+        """注册宿主侧工作流；模型只能调用已注册名称。"""
+        self.validate_name(name)
+        self.workflows[name] = WorkflowDefinition(
+            name=name,
+            description=description,
+            phases=phases,
+            handler=handler,
+        )
+
+    def run(
+        self,
+        name: str,
+        args: Optional[Dict[str, Any]] = None,
+        resume_from_run_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """运行或恢复一个 workflow。"""
+        self.validate_name(name)
+        if name not in self.workflows:
+            available = ", ".join(sorted(self.workflows))
+            raise ValueError(f"未知 workflow：{name}；可用：{available}")
+        if args is None:
+            args = {}
+        if not isinstance(args, dict):
+            raise ValueError("workflow args 必须是对象")
+
+        run_id = resume_from_run_id or self.new_run_id()
+        self.validate_run_id(run_id)
+        journal = WorkflowJournal(self.workflow_dir, run_id)
+        state = ExecutionState(self, run_id, name, args, journal)
+        definition = self.workflows[name]
+        state.log(f"workflow started: {name}")
+        result = definition.handler(state, args)
+        state.log(f"workflow finished: {name}")
+        payload = {
+            "run_id": run_id,
+            "workflow": name,
+            "phases": definition.phases,
+            "result": result,
+            "events": state.events,
+            "journal": self.display_path(journal.path)
+            if journal.path.exists() else "",
+        }
+        self.write_run_summary(run_id, payload)
+        return payload
+
+    def list(self) -> str:
+        """列出可运行 workflow。"""
+        if not self.workflows:
+            return "当前没有可用 workflow"
+        lines = []
+        for workflow in self.workflows.values():
+            phases = " -> ".join(workflow.phases)
+            lines.append(
+                f"- {workflow.name}: {workflow.description}; phases={phases}"
+            )
+        return "\n".join(lines)
+
+    def write_run_summary(self, run_id: str, payload: Dict[str, Any]) -> None:
+        """保存 workflow 摘要，方便用户和后续 Agent 查看。"""
+        self.workflow_dir.mkdir(parents=True, exist_ok=True)
+        path = self.workflow_dir / f"{run_id}.json"
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n",
+            encoding="utf-8",
+        )
+
+    def display_path(self, path: Path) -> str:
+        """项目内路径显示相对路径，项目外测试路径显示绝对路径。"""
+        try:
+            return str(path.resolve().relative_to(WORKDIR))
+        except ValueError:
+            return str(path.resolve())
+
+    def register_builtin_workflows(self) -> None:
+        """注册内置样例 workflow。"""
+        self.register(
+            "review-changes",
+            "Review code changes through fixed audit and verification phases.",
+            ["collect", "audit", "verify", "summarize"],
+            review_changes_workflow,
+        )
+
+    def new_run_id(self) -> str:
+        """生成 workflow run id。"""
+        while True:
+            run_id = f"wf_{secrets.token_hex(4)}"
+            if not (self.workflow_dir / f"{run_id}.journal.jsonl").exists():
+                return run_id
+
+    def validate_name(self, name: str) -> None:
+        """限制 workflow 名称，避免模型传入任意代码或路径。"""
+        if not isinstance(name, str) or not self.NAME_PATTERN.match(name):
+            raise ValueError(f"workflow 名称不合法：{name}")
+
+    def validate_run_id(self, run_id: str) -> None:
+        """限制 resume run id，只允许本地生成的短 ID。"""
+        if not isinstance(run_id, str) or not self.RUN_PATTERN.match(run_id):
+            raise ValueError(f"workflow run_id 不合法：{run_id}")
+
+
+def review_changes_workflow(
+    state: ExecutionState, args: Dict[str, Any]
+) -> Dict[str, Any]:
+    """样例工作流：固定执行收集、审查、验证、总结四个阶段。"""
+    changes = str(args.get("changes", "")).strip()
+    if not changes:
+        changes = run_bash("git diff --stat")
+
+    state.phase("collect")
+    state.log("collected change summary")
+
+    audit_prompts = [
+        (
+            "security",
+            "从安全和权限边界角度审查这些改动，返回具体风险：\n"
+            f"{changes}",
+        ),
+        (
+            "logic",
+            "从逻辑 bug 和边界条件角度审查这些改动，返回具体风险：\n"
+            f"{changes}",
+        ),
+        (
+            "tests",
+            "从测试覆盖和验证充分性角度审查这些改动，返回缺口：\n"
+            f"{changes}",
+        ),
+    ]
+
+    state.phase("audit")
+    audits = state.parallel(
+        [
+            lambda label=label, prompt=prompt: state.agent(
+                prompt, label=f"audit:{label}"
+            )
+            for label, prompt in audit_prompts
+        ],
+        label="audit-dimensions",
+    )
+
+    state.phase("verify")
+    verification = state.agent(
+        "请验证以下审查结果是否有重复、误报或缺少证据，"
+        "并给出最终需要保留的问题：\n"
+        f"{json.dumps(audits, ensure_ascii=False, default=str)}",
+        label="verify-findings",
+    )
+
+    state.phase("summarize")
+    summary = state.agent(
+        "请把 workflow 的代码审查结果整理成简洁中文总结，"
+        "包括主要风险、测试建议和是否可以继续提交：\n"
+        f"{json.dumps(verification, ensure_ascii=False, default=str)}",
+        label="summarize-review",
+    )
+
+    return {
+        "changes": changes,
+        "audits": audits,
+        "verification": verification,
+        "summary": summary,
+    }
+
+
+WORKFLOWS = WorkflowRuntime(WORKFLOW_DIR)
+
+
 def assemble_tool_pool(
     base_tools: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
@@ -2508,6 +2905,43 @@ TOOLS = [
         "function": {
             "name": "list_mcp_servers",
             "description": "List available and connected MCP-style servers.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_workflow",
+            "description": (
+                "Run a registered host-side workflow for fixed multi-step "
+                "procedures. The model chooses the workflow and args; host "
+                "code controls the orchestration and journal."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Workflow name, such as review-changes.",
+                    },
+                    "args": {
+                        "type": "object",
+                        "description": "Workflow-specific JSON arguments.",
+                    },
+                    "resume_from_run_id": {
+                        "type": "string",
+                        "description": "Optional previous workflow run id.",
+                    },
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_workflows",
+            "description": "List registered host-side workflows.",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -3077,6 +3511,21 @@ def run_list_mcp_servers() -> str:
     return MCP.list_servers()
 
 
+def run_workflow(
+    name: str,
+    args: Optional[Dict[str, Any]] = None,
+    resume_from_run_id: Optional[str] = None,
+) -> str:
+    """运行一个宿主侧已注册 workflow，并返回结构化结果。"""
+    payload = WORKFLOWS.run(name, args or {}, resume_from_run_id)
+    return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+
+
+def run_list_workflows() -> str:
+    """列出可用 workflow。"""
+    return WORKFLOWS.list()
+
+
 def run_create_task(subject: str, description: str = "") -> str:
     """创建一个持久化任务，并把生成的 ID 返回给模型。"""
     task = TASKS.create(subject, description)
@@ -3195,6 +3644,8 @@ TOOL_HANDLERS: Dict[str, Callable[..., str]] = {
     "remember": run_remember,
     "connect_mcp": run_connect_mcp,
     "list_mcp_servers": run_list_mcp_servers,
+    "run_workflow": run_workflow,
+    "list_workflows": run_list_workflows,
     "create_task": run_create_task,
     "get_task": run_get_task,
     "list_tasks": run_list_tasks,
@@ -3289,6 +3740,24 @@ def check_permission_rules(
             MCP.validate_server_name(name)
         except ValueError as exc:
             return PermissionDecision.DENY, str(exc)
+
+    if tool_name == "run_workflow":
+        name = arguments.get("name")
+        args = arguments.get("args", {})
+        resume_from_run_id = arguments.get("resume_from_run_id")
+        try:
+            WORKFLOWS.validate_name(name)
+        except ValueError as exc:
+            return PermissionDecision.DENY, str(exc)
+        if name not in WORKFLOWS.workflows:
+            return PermissionDecision.DENY, f"未知 workflow：{name}"
+        if not isinstance(args, dict):
+            return PermissionDecision.DENY, "workflow args 必须是对象"
+        if resume_from_run_id is not None:
+            try:
+                WORKFLOWS.validate_run_id(resume_from_run_id)
+            except ValueError as exc:
+                return PermissionDecision.DENY, str(exc)
 
     if MCP.is_mcp_tool(tool_name):
         try:
