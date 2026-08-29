@@ -1,4 +1,4 @@
-"""编程智能体的第十四个版本：增加 MCP Plugin 动态工具接入。"""
+"""编程智能体的第十五个版本：把多种机制集成进同一个 Agent Loop。"""
 
 import ast
 import datetime as dt
@@ -57,6 +57,9 @@ BASE_SYSTEM_PROMPT = (
     "wait for the user's confirmation before calling spawn_teammate. "
     "Use connect_mcp to connect external tool servers before calling their "
     "dynamically discovered mcp__server__tool functions. "
+    "All runtime mechanisms are integrated into one loop: notifications, "
+    "memory, skills, context compaction, MCP tools, permissions, hooks, and "
+    "tool results must flow through the same message pipeline. "
     "Tool calls may be denied by the local permission system. "
     "If a call is denied, do not claim it succeeded; choose a safer approach. "
     "When the task is complete, answer the user directly."
@@ -184,14 +187,58 @@ class SkillLoader:
 SKILL_LOADER = SkillLoader(SKILLS_DIR)
 
 
-def build_system_prompt() -> str:
-    """运行时拼接主 Agent 提示词和技能目录。"""
+def runtime_status_summary() -> str:
+    """汇总 S15 集成运行时状态，供 system prompt 使用。"""
+    sections = []
+
+    try:
+        task_count = len(TASKS.list())
+        sections.append(f"- persisted tasks: {task_count}")
+    except Exception:
+        sections.append("- persisted tasks: unavailable")
+
+    try:
+        cron_jobs = CRONS.list()
+        active_crons = sum(job.active for job in cron_jobs)
+        sections.append(
+            f"- cron jobs: {active_crons} active / {len(cron_jobs)} total"
+        )
+    except Exception:
+        sections.append("- cron jobs: unavailable")
+
+    try:
+        sections.append(f"- background tasks:\n{BACKGROUND.status_text()}")
+    except Exception:
+        sections.append("- background tasks: unavailable")
+
+    try:
+        sections.append(f"- teammates:\n{TEAM.list()}")
+    except Exception:
+        sections.append("- teammates: unavailable")
+
+    try:
+        sections.append(f"- MCP servers:\n{MCP.list_servers()}")
+    except Exception:
+        sections.append("- MCP servers: unavailable")
+
+    return "\n".join(sections)
+
+
+def build_system_prompt(
+    client: Optional[OpenAI] = None,
+    current_request: str = "",
+) -> str:
+    """运行时拼接主 Agent 提示词、技能目录、记忆和运行时状态。"""
     SKILL_LOADER.scan()
-    return (
+    prompt = (
         f"{BASE_SYSTEM_PROMPT}\n\n"
         f"Available skills:\n{SKILL_LOADER.catalog()}\n\n"
+        f"Runtime status:\n{runtime_status_summary()}\n\n"
         "Call load_skill with a skill name before following its full rules."
     )
+    if client is None or not current_request:
+        return prompt
+    return attach_recalled_memory(client, prompt, current_request)
 
 
 def build_subagent_system_prompt() -> str:
@@ -2874,6 +2921,34 @@ def inject_team_events(messages: List[Dict[str, Any]]) -> None:
         messages.append({"role": "user", "content": events})
 
 
+def set_system_message(messages: List[Dict[str, Any]], content: str) -> None:
+    """把最新运行时 system prompt 放到 messages 第一条。"""
+    system_message = {"role": "system", "content": content}
+    if messages and messages[0].get("role") == "system":
+        messages[0] = system_message
+    else:
+        messages.insert(0, system_message)
+
+
+def prepare_runtime_context(
+    client: OpenAI,
+    messages: List[Dict[str, Any]],
+    active_request: str,
+    agent_name: str,
+) -> List[Dict[str, Any]]:
+    """S15 统一入口：注入事件、更新提示词、压缩上下文。"""
+    inject_background_results(messages)
+    inject_scheduled_prompts(messages)
+    if agent_name == "Agent":
+        inject_team_events(messages)
+        set_system_message(
+            messages,
+            build_system_prompt(client, active_request),
+        )
+
+    return COMPACTOR.prepare(client, messages, active_request)
+
+
 class TodoManager:
     """保存当前会话中的任务计划，并校验模型传入的 todo 列表。"""
 
@@ -3481,6 +3556,64 @@ def execute_tool(
         return f"错误：{exc}"
 
 
+def is_prompt_too_long_error(error_text: str) -> bool:
+    """判断模型错误是否和上下文过长有关。"""
+    lowered = error_text.lower()
+    return (
+        "prompt_too_long" in lowered
+        or "too many tokens" in lowered
+        or "context length" in lowered
+    )
+
+
+def is_retryable_model_error(error_text: str) -> bool:
+    """判断模型错误是否适合短暂退避后重试。"""
+    lowered = error_text.lower()
+    return (
+        "429" in lowered
+        or "529" in lowered
+        or "rate limit" in lowered
+        or "overloaded" in lowered
+        or "temporarily unavailable" in lowered
+    )
+
+
+def call_model_with_recovery(
+    client: OpenAI,
+    messages: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]],
+    active_request: str,
+    max_attempts: int = 3,
+) -> Any:
+    """统一模型调用恢复：上下文过长触发压缩，临时错误短退避重试。"""
+    last_error: Optional[Exception] = None
+    for attempt in range(max_attempts):
+        try:
+            return client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+            )
+        except Exception as exc:
+            last_error = exc
+            error_text = str(exc)
+            if is_prompt_too_long_error(error_text):
+                messages[:] = COMPACTOR.reactive_compact(
+                    client, messages, active_request
+                )
+                continue
+            if is_retryable_model_error(error_text) and attempt < max_attempts - 1:
+                wait_seconds = min(2.0, 0.25 * (2 ** attempt))
+                threading.Event().wait(wait_seconds)
+                continue
+            raise
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("模型调用失败：没有可用响应")
+
+
 def agent_loop(
     client: OpenAI,
     messages: List[Dict[str, Any]],
@@ -3496,38 +3629,16 @@ def agent_loop(
     base_tools = tools
     base_handlers = handlers
     rounds_since_todo = 0
-    reactive_retries = 0
 
     for _step in range(max_steps):
         current_tools = assemble_tool_pool(base_tools)
         current_handlers = assemble_tool_handlers(base_handlers)
-        inject_background_results(messages)
-        inject_scheduled_prompts(messages)
-        if agent_name == "Agent":
-            inject_team_events(messages)
-        messages[:] = COMPACTOR.prepare(client, messages, active_request)
-        try:
-            response = client.chat.completions.create(
-                model=MODEL,
-                messages=messages,
-                tools=current_tools,
-                tool_choice="auto",
-            )
-            reactive_retries = 0
-        except Exception as exc:
-            error_text = str(exc).lower()
-            too_long = (
-                "prompt_too_long" in error_text
-                or "too many tokens" in error_text
-                or "context length" in error_text
-            )
-            if too_long and reactive_retries < 1:
-                messages[:] = COMPACTOR.reactive_compact(
-                    client, messages, active_request
-                )
-                reactive_retries += 1
-                continue
-            raise
+        messages[:] = prepare_runtime_context(
+            client, messages, active_request, agent_name
+        )
+        response = call_model_with_recovery(
+            client, messages, current_tools, active_request
+        )
 
         assistant_message = response.choices[0].message
         messages.append(assistant_message.model_dump(exclude_none=True))
@@ -3666,10 +3777,6 @@ def main() -> None:
             continue
 
         trigger_hooks("UserPromptSubmit", query)
-        recalled = MEMORY.recall(client, query)
-        memory_text = MEMORY.format_recalled(recalled)
-        if memory_text:
-            messages.append({"role": "system", "content": memory_text})
         messages.append({"role": "user", "content": query})
         agent_loop(
             client, messages, active_request=query, extract_memory=True
