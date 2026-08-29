@@ -7,3 +7,4 @@ test/
 .transcripts/
 .memory/
 .tasks/
+.scheduled_tasks.json

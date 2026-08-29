@@ -1,4 +1,4 @@
-"""编程智能体的第十一个版本：让慢命令可以放到后台执行。"""
+"""编程智能体的第十二个版本：增加 Cron Scheduler 定时调度。"""
 
 import ast
 import datetime as dt
@@ -29,6 +29,7 @@ TASK_OUTPUTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
 MEMORY_DIR = WORKDIR / ".memory"
 MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 TASKS_DIR = WORKDIR / ".tasks"
+SCHEDULE_FILE = WORKDIR / ".scheduled_tasks.json"
 
 BASE_SYSTEM_PROMPT = (
     f"You are Coding Agent, a local coding agent powered by DeepSeek. "
@@ -49,6 +50,8 @@ BASE_SYSTEM_PROMPT = (
     "or ownership. "
     "For slow shell commands, set bash.run_in_background to true so the "
     "command can run in the background while the loop continues. "
+    "Use cron tools to schedule future prompts; cron only delivers prompts, "
+    "and the agent loop decides which tools to call when the prompt arrives. "
     "Tool calls may be denied by the local permission system. "
     "If a call is denied, do not claim it succeeded; choose a safer approach. "
     "When the task is complete, answer the user directly."
@@ -1329,6 +1332,320 @@ class BackgroundManager:
 
 BACKGROUND = BackgroundManager()
 
+
+@dataclass
+class CronJob:
+    """一条定时任务：到点后把 prompt 投递给 Agent。"""
+
+    id: str
+    cron: str
+    prompt: str
+    recurring: bool = True
+    durable: bool = True
+    active: bool = True
+    pending_delivery: bool = False
+    last_fired: Optional[str] = None
+
+
+class CronManager:
+    """管理 cron 任务：保存、匹配时间、到点入队、交付 prompt。"""
+
+    FIELD_RANGES = (
+        (0, 59),   # minute
+        (0, 23),   # hour
+        (1, 31),   # day of month
+        (1, 12),   # month
+        (0, 6),    # day of week, 0 表示周日
+    )
+
+    def __init__(self, schedule_file: Path) -> None:
+        self.schedule_file = schedule_file
+        self.jobs: Dict[str, CronJob] = {}
+        self._queue: List[str] = []
+        self._lock = threading.Lock()
+        self._scheduler_started = False
+        self.load()
+
+    def schedule(
+        self,
+        cron: str,
+        prompt: str,
+        recurring: bool = True,
+        durable: bool = True,
+    ) -> CronJob:
+        """创建定时任务，并在 durable=true 时保存到磁盘。"""
+        cron = self.clean(cron)
+        prompt = prompt.strip() if isinstance(prompt, str) else ""
+        self.validate_cron(cron)
+        if not prompt:
+            raise ValueError("定时任务 prompt 不能为空")
+        if not isinstance(recurring, bool):
+            raise ValueError("recurring 必须是布尔值")
+        if not isinstance(durable, bool):
+            raise ValueError("durable 必须是布尔值")
+
+        job = CronJob(
+            id=self.new_id(),
+            cron=cron,
+            prompt=prompt,
+            recurring=recurring,
+            durable=durable,
+        )
+        with self._lock:
+            self.jobs[job.id] = job
+            self.save()
+        self.start_scheduler()
+        return job
+
+    def list(self) -> List[CronJob]:
+        """返回全部定时任务，包括已取消任务，方便审计。"""
+        with self._lock:
+            return sorted(self.jobs.values(), key=lambda job: job.id)
+
+    def cancel(self, cron_id: str) -> str:
+        """取消定时任务；只标记 inactive，不删除记录。"""
+        self.validate_cron_id(cron_id)
+        with self._lock:
+            job = self.jobs.get(cron_id)
+            if job is None:
+                raise ValueError(f"定时任务不存在：{cron_id}")
+            job.active = False
+            job.pending_delivery = False
+            self.save()
+        return f"Cancelled {cron_id}"
+
+    def tick(self, now: Optional[dt.datetime] = None) -> List[str]:
+        """检查当前时间，把到点任务放入待交付队列。"""
+        now = now or dt.datetime.now()
+        fire_key = now.strftime("%Y-%m-%dT%H:%M")
+        queued: List[str] = []
+        changed = False
+
+        with self._lock:
+            for job in self.jobs.values():
+                if not job.active:
+                    continue
+                if job.pending_delivery:
+                    continue
+                if job.last_fired == fire_key:
+                    continue
+                if not self.matches(job.cron, now):
+                    continue
+
+                job.pending_delivery = True
+                job.last_fired = fire_key
+                self._queue.append(job.id)
+                queued.append(job.id)
+                changed = True
+                if not job.recurring:
+                    job.active = False
+
+            if changed:
+                self.save()
+
+        return queued
+
+    def collect(self) -> List[str]:
+        """取出已经到点但尚未交给 Agent 的 scheduled prompt。"""
+        self.tick()
+        delivered: List[str] = []
+        changed = False
+
+        with self._lock:
+            queued_ids = list(self._queue)
+            self._queue.clear()
+            for cron_id in queued_ids:
+                job = self.jobs.get(cron_id)
+                if job is None:
+                    continue
+                job.pending_delivery = False
+                delivered.append(self.format_delivery(job))
+                changed = True
+
+            if changed:
+                self.save()
+
+        return delivered
+
+    def format_delivery(self, job: CronJob) -> str:
+        """把定时任务转换成 Agent 可以理解的新请求。"""
+        return (
+            f"[Scheduled {job.id}]\n"
+            f"Cron: {job.cron}\n"
+            f"Prompt: {job.prompt}"
+        )
+
+    def start_scheduler(self) -> None:
+        """启动轻量调度线程；它只负责到点入队，不直接跑 Agent。"""
+        with self._lock:
+            if self._scheduler_started:
+                return
+            self._scheduler_started = True
+
+        thread = threading.Thread(target=self._loop, daemon=True)
+        thread.start()
+
+    def _loop(self) -> None:
+        """后台调度循环，每秒检查一次是否有任务到点。"""
+        while True:
+            self.tick()
+            threading.Event().wait(1)
+
+    def matches(self, cron: str, now: dt.datetime) -> bool:
+        """判断五段式 cron 表达式是否匹配当前分钟。"""
+        fields = cron.split()
+        if len(fields) != 5:
+            return False
+        values = (
+            now.minute,
+            now.hour,
+            now.day,
+            now.month,
+            (now.weekday() + 1) % 7,
+        )
+        return all(
+            self.match_field(field, value, allowed_range)
+            for field, value, allowed_range
+            in zip(fields, values, self.FIELD_RANGES)
+        )
+
+    def validate_cron(self, cron: str) -> None:
+        """校验五段式 cron 表达式，支持 *、*/n、数字、范围和逗号。"""
+        fields = cron.split()
+        if len(fields) != 5:
+            raise ValueError("cron 必须是五段式：minute hour day month weekday")
+        for field, allowed_range in zip(fields, self.FIELD_RANGES):
+            self.parse_field(field, allowed_range)
+
+    def match_field(
+        self, field: str, value: int, allowed_range: Tuple[int, int]
+    ) -> bool:
+        """判断某个 cron 字段是否包含当前值。"""
+        return value in self.parse_field(field, allowed_range)
+
+    def parse_field(
+        self, field: str, allowed_range: Tuple[int, int]
+    ) -> List[int]:
+        """解析单个 cron 字段。"""
+        lower, upper = allowed_range
+        values = set()
+        for part in field.split(","):
+            part = part.strip()
+            if not part:
+                raise ValueError("cron 字段不能为空")
+
+            if part == "*":
+                values.update(range(lower, upper + 1))
+            elif part.startswith("*/"):
+                step = int(part[2:])
+                if step <= 0:
+                    raise ValueError("cron 步长必须大于 0")
+                values.update(range(lower, upper + 1, step))
+            elif "-" in part:
+                start_text, end_text = part.split("-", 1)
+                start = int(start_text)
+                end = int(end_text)
+                if start > end:
+                    raise ValueError("cron 范围起点不能大于终点")
+                self.ensure_in_range(start, allowed_range)
+                self.ensure_in_range(end, allowed_range)
+                values.update(range(start, end + 1))
+            else:
+                value = int(part)
+                self.ensure_in_range(value, allowed_range)
+                values.add(value)
+
+        return sorted(values)
+
+    def ensure_in_range(
+        self, value: int, allowed_range: Tuple[int, int]
+    ) -> None:
+        """确保 cron 字段值在允许范围内。"""
+        lower, upper = allowed_range
+        if value < lower or value > upper:
+            raise ValueError(f"cron 字段值超出范围：{value}")
+
+    def load(self) -> None:
+        """从磁盘恢复 durable 的定时任务。"""
+        if not self.schedule_file.exists():
+            return
+        try:
+            data = json.loads(self.schedule_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+
+        loaded: Dict[str, CronJob] = {}
+        if isinstance(data, list):
+            for item in data:
+                try:
+                    job = self.job_from_dict(item)
+                    loaded[job.id] = job
+                except ValueError:
+                    continue
+        self.jobs = loaded
+
+    def save(self) -> None:
+        """保存 durable 定时任务；非 durable 任务只保留在内存中。"""
+        durable_jobs = [
+            asdict(job) for job in self.jobs.values() if job.durable
+        ]
+        self.schedule_file.write_text(
+            json.dumps(durable_jobs, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    def job_from_dict(self, data: Any) -> CronJob:
+        """把磁盘 JSON 转回 CronJob，并做基础校验。"""
+        if not isinstance(data, dict):
+            raise ValueError("cron 记录必须是对象")
+        cron_id = data.get("id")
+        cron = data.get("cron")
+        prompt = data.get("prompt")
+        if not isinstance(cron_id, str):
+            raise ValueError("cron id 必须是字符串")
+        self.validate_cron_id(cron_id)
+        if not isinstance(cron, str):
+            raise ValueError("cron 必须是字符串")
+        self.validate_cron(cron)
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("prompt 不能为空")
+
+        return CronJob(
+            id=cron_id,
+            cron=cron,
+            prompt=prompt,
+            recurring=bool(data.get("recurring", True)),
+            durable=bool(data.get("durable", True)),
+            active=bool(data.get("active", True)),
+            pending_delivery=bool(data.get("pending_delivery", False)),
+            last_fired=data.get("last_fired")
+            if isinstance(data.get("last_fired"), str)
+            else None,
+        )
+
+    def validate_cron_id(self, cron_id: str) -> None:
+        """限制 cron ID 只能是 cron_ 加 8 位十六进制字符。"""
+        if not isinstance(cron_id, str):
+            raise ValueError("cron ID 必须是字符串")
+        if not re.match(r"^cron_[0-9a-f]{8}$", cron_id):
+            raise ValueError(f"cron ID 不合法：{cron_id}")
+
+    def new_id(self) -> str:
+        """生成短 cron ID。"""
+        while True:
+            cron_id = f"cron_{secrets.token_hex(4)}"
+            if cron_id not in self.jobs:
+                return cron_id
+
+    def clean(self, value: Any) -> str:
+        """清理 cron 表达式中的多余空白。"""
+        if not isinstance(value, str):
+            return ""
+        return " ".join(value.strip().split())
+
+
+CRONS = CronManager(SCHEDULE_FILE)
+
 TOOLS = [
     {
         "type": "function",
@@ -1675,6 +1992,71 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "schedule_cron",
+            "description": (
+                "Schedule a future prompt with a five-field cron expression. "
+                "This does not run commands directly; it delivers the prompt "
+                "back into the agent loop when the schedule fires."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cron": {
+                        "type": "string",
+                        "description": (
+                            "Five-field cron expression, such as */5 * * * * "
+                            "or 0 9 * * 1-5."
+                        ),
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Prompt to deliver when the cron fires.",
+                    },
+                    "recurring": {
+                        "type": "boolean",
+                        "description": "Whether the schedule repeats.",
+                    },
+                    "durable": {
+                        "type": "boolean",
+                        "description": (
+                            "Whether to persist this schedule to disk."
+                        ),
+                    },
+                },
+                "required": ["cron", "prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_crons",
+            "description": "List scheduled cron prompts and their states.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_cron",
+            "description": (
+                "Cancel a scheduled cron prompt by marking it inactive."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cron_id": {
+                        "type": "string",
+                        "description": "Cron id such as cron_ab12cd34.",
+                    }
+                },
+                "required": ["cron_id"],
+            },
+        },
+    },
 ]
 
 
@@ -1813,6 +2195,18 @@ def inject_background_results(messages: List[Dict[str, Any]]) -> None:
             "content": "\n\n".join(notifications),
         }
     )
+
+
+def collect_scheduled_prompts() -> List[str]:
+    """收集已经到点的 cron prompt。"""
+    return CRONS.collect()
+
+
+def inject_scheduled_prompts(messages: List[Dict[str, Any]]) -> None:
+    """在每次 LLM 调用前，把到点的定时任务注入上下文。"""
+    scheduled_prompts = collect_scheduled_prompts()
+    for prompt in scheduled_prompts:
+        messages.append({"role": "user", "content": prompt})
 
 
 class TodoManager:
@@ -1981,6 +2375,41 @@ def run_complete_task(task_id: str, owner: str = "agent") -> str:
     return TASKS.complete(task_id, owner)
 
 
+def run_schedule_cron(
+    cron: str,
+    prompt: str,
+    recurring: bool = True,
+    durable: bool = True,
+) -> str:
+    """创建定时 prompt；到点后由 Agent Loop 正常处理。"""
+    job = CRONS.schedule(cron, prompt, recurring, durable)
+    return json.dumps(asdict(job), ensure_ascii=False, indent=2)
+
+
+def run_list_crons() -> str:
+    """列出当前 cron 调度表。"""
+    jobs = CRONS.list()
+    if not jobs:
+        return "当前没有定时任务"
+
+    lines = []
+    for job in jobs:
+        state = "active" if job.active else "inactive"
+        pending = "pending_delivery" if job.pending_delivery else "idle"
+        repeat = "recurring" if job.recurring else "once"
+        storage = "durable" if job.durable else "memory"
+        lines.append(
+            f"- {job.id} [{state}/{pending}/{repeat}/{storage}] "
+            f"{job.cron} -> {job.prompt}"
+        )
+    return "\n".join(lines)
+
+
+def run_cancel_cron(cron_id: str) -> str:
+    """取消定时任务，不删除历史记录。"""
+    return CRONS.cancel(cron_id)
+
+
 TOOL_HANDLERS: Dict[str, Callable[..., str]] = {
     "bash": run_bash,
     "read_file": run_read,
@@ -1998,6 +2427,9 @@ TOOL_HANDLERS: Dict[str, Callable[..., str]] = {
     "update_task": run_update_task,
     "claim_task": run_claim_task,
     "complete_task": run_complete_task,
+    "schedule_cron": run_schedule_cron,
+    "list_crons": run_list_crons,
+    "cancel_cron": run_cancel_cron,
 }
 
 SUBAGENT_TOOLS = [
@@ -2080,6 +2512,28 @@ def check_permission_rules(
                 return PermissionDecision.DENY, "依赖任务 ID 必须是字符串"
             if not TASKS.ID_PATTERN.match(dependency_id):
                 return PermissionDecision.DENY, "依赖任务 ID 格式不合法"
+
+    if tool_name == "schedule_cron":
+        cron = arguments.get("cron")
+        prompt = arguments.get("prompt")
+        if not isinstance(cron, str):
+            return PermissionDecision.DENY, "cron 必须是字符串"
+        try:
+            CRONS.validate_cron(CRONS.clean(cron))
+        except ValueError as exc:
+            return PermissionDecision.DENY, str(exc)
+        if not isinstance(prompt, str) or not prompt.strip():
+            return PermissionDecision.DENY, "定时任务 prompt 不能为空"
+        for flag in ("recurring", "durable"):
+            if flag in arguments and not isinstance(arguments.get(flag), bool):
+                return PermissionDecision.DENY, f"{flag} 必须是布尔值"
+
+    if tool_name == "cancel_cron":
+        cron_id = arguments.get("cron_id")
+        try:
+            CRONS.validate_cron_id(cron_id)
+        except ValueError as exc:
+            return PermissionDecision.DENY, str(exc)
 
     if tool_name in {"read_file", "write_file", "edit_file"}:
         path = arguments.get("path")
@@ -2285,6 +2739,7 @@ def agent_loop(
 
     for _step in range(max_steps):
         inject_background_results(messages)
+        inject_scheduled_prompts(messages)
         messages[:] = COMPACTOR.prepare(client, messages, active_request)
         try:
             response = client.chat.completions.create(
