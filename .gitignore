@@ -8,3 +8,4 @@ test/
 .memory/
 .tasks/
 .scheduled_tasks.json
+.mailboxes/

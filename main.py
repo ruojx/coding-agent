@@ -1,4 +1,4 @@
-"""编程智能体的第十二个版本：增加 Cron Scheduler 定时调度。"""
+"""编程智能体的第十三个版本：增加 Agent Teams 团队运行时。"""
 
 import ast
 import datetime as dt
@@ -30,6 +30,7 @@ MEMORY_DIR = WORKDIR / ".memory"
 MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 TASKS_DIR = WORKDIR / ".tasks"
 SCHEDULE_FILE = WORKDIR / ".scheduled_tasks.json"
+MAILBOX_DIR = WORKDIR / ".mailboxes"
 
 BASE_SYSTEM_PROMPT = (
     f"You are Coding Agent, a local coding agent powered by DeepSeek. "
@@ -52,6 +53,8 @@ BASE_SYSTEM_PROMPT = (
     "command can run in the background while the loop continues. "
     "Use cron tools to schedule future prompts; cron only delivers prompts, "
     "and the agent loop decides which tools to call when the prompt arrives. "
+    "When parallel work would help, propose a small teammate plan first and "
+    "wait for the user's confirmation before calling spawn_teammate. "
     "Tool calls may be denied by the local permission system. "
     "If a call is denied, do not claim it succeeded; choose a safer approach. "
     "When the task is complete, answer the user directly."
@@ -1646,6 +1649,301 @@ class CronManager:
 
 CRONS = CronManager(SCHEDULE_FILE)
 
+
+@dataclass
+class TeamMessage:
+    """团队成员之间传递的一条消息。"""
+
+    id: str
+    sender: str
+    receiver: str
+    type: str
+    content: str
+    created_at: str
+    metadata: Dict[str, Any]
+
+
+class MessageBus:
+    """用 JSONL 收件箱隔离多个 Agent 的通信。"""
+
+    NAME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{1,31}$")
+
+    def __init__(self, mailbox_dir: Path) -> None:
+        self.mailbox_dir = mailbox_dir
+        self._lock = threading.Lock()
+        self._offsets: Dict[str, int] = {}
+
+    def send(
+        self,
+        sender: str,
+        receiver: str,
+        content: str,
+        message_type: str = "message",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> TeamMessage:
+        """向指定收件箱追加一条消息。"""
+        self.validate_name(sender)
+        self.validate_name(receiver)
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("消息内容不能为空")
+        if not isinstance(message_type, str) or not message_type.strip():
+            raise ValueError("消息类型不能为空")
+
+        message = TeamMessage(
+            id=f"msg_{secrets.token_hex(4)}",
+            sender=sender,
+            receiver=receiver,
+            type=message_type.strip(),
+            content=content.strip(),
+            created_at=dt.datetime.now().isoformat(timespec="seconds"),
+            metadata=metadata or {},
+        )
+
+        with self._lock:
+            self.mailbox_dir.mkdir(parents=True, exist_ok=True)
+            with self.path_for(receiver).open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(asdict(message), ensure_ascii=False) + "\n"
+                )
+        return message
+
+    def read_inbox(self, receiver: str) -> List[TeamMessage]:
+        """读取尚未消费的收件箱消息；不删除文件，只移动内存偏移。"""
+        self.validate_name(receiver)
+        path = self.path_for(receiver)
+        if not path.exists():
+            return []
+
+        messages: List[TeamMessage] = []
+        with self._lock:
+            offset = self._offsets.get(receiver, 0)
+            with path.open("r", encoding="utf-8") as handle:
+                handle.seek(offset)
+                for line in handle:
+                    try:
+                        messages.append(self.message_from_dict(json.loads(line)))
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                self._offsets[receiver] = handle.tell()
+        return messages
+
+    def format_messages(self, receiver: str) -> str:
+        """把收件箱事件渲染成可以注入模型上下文的文本。"""
+        messages = self.read_inbox(receiver)
+        if not messages:
+            return ""
+
+        lines = ["[Team events]"]
+        for message in messages:
+            lines.append(
+                f"- {message.created_at} {message.sender} -> "
+                f"{message.receiver} ({message.type}): {message.content}"
+            )
+        return "\n".join(lines)
+
+    def path_for(self, receiver: str) -> Path:
+        """返回某个成员的收件箱文件路径。"""
+        self.validate_name(receiver)
+        return self.mailbox_dir / f"{receiver}.jsonl"
+
+    def message_from_dict(self, data: Any) -> TeamMessage:
+        """把 JSON 对象转换成 TeamMessage。"""
+        if not isinstance(data, dict):
+            raise ValueError("消息必须是对象")
+        return TeamMessage(
+            id=str(data.get("id", "")),
+            sender=str(data.get("sender", "")),
+            receiver=str(data.get("receiver", "")),
+            type=str(data.get("type", "")),
+            content=str(data.get("content", "")),
+            created_at=str(data.get("created_at", "")),
+            metadata=data.get("metadata")
+            if isinstance(data.get("metadata"), dict)
+            else {},
+        )
+
+    def validate_name(self, name: str) -> None:
+        """限制成员名，防止收件箱路径穿越。"""
+        if not isinstance(name, str) or not self.NAME_PATTERN.match(name):
+            raise ValueError(f"成员名不合法：{name}")
+
+
+BUS = MessageBus(MAILBOX_DIR)
+
+
+class TeammateRuntime:
+    """一个持久队友：独立 messages、独立线程、独立工作状态。"""
+
+    def __init__(self, name: str, role: str, bus: MessageBus) -> None:
+        BUS.validate_name(name)
+        self.name = name
+        self.role = role.strip() if isinstance(role, str) else ""
+        self.bus = bus
+        self.status = "idle"
+        self.current_prompt: Optional[str] = None
+        self.messages: List[Dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": self.system_prompt(),
+            }
+        ]
+        self._queue: List[str] = []
+        self._stop_requested = False
+        self._lock = threading.Lock()
+        self._changed = threading.Condition(self._lock)
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def assign(self, prompt: str) -> str:
+        """给队友追加一项工作；队友会在自己的线程中处理。"""
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("队友任务 prompt 不能为空")
+        with self._changed:
+            if self._stop_requested:
+                raise ValueError(f"{self.name} 正在关机，不能接新任务")
+            self._queue.append(prompt.strip())
+            self._changed.notify_all()
+        return f"Assigned work to {self.name}"
+
+    def request_shutdown(self) -> str:
+        """请求队友在当前任务结束后平滑停止。"""
+        with self._changed:
+            self._stop_requested = True
+            self._changed.notify_all()
+        return f"Shutdown requested for {self.name}"
+
+    def summary(self) -> str:
+        """返回队友当前状态。"""
+        with self._lock:
+            queued = len(self._queue)
+            prompt = self.current_prompt or "(none)"
+            return (
+                f"- {self.name} [{self.status}] role={self.role or 'teammate'} "
+                f"queued={queued} current={prompt}"
+            )
+
+    def system_prompt(self) -> str:
+        """组装队友自己的系统提示。"""
+        role_text = self.role or "完成 Lead 分配的局部任务"
+        return (
+            f"You are teammate {self.name} inside Coding Agent. "
+            f"Your role: {role_text}. "
+            f"You are working in {WORKDIR}. "
+            "Use tools when needed, but keep changes focused on your assigned "
+            "work. Send concise final results; the runtime will report them "
+            "to lead. Do not claim to be Claude, Anthropic, OpenAI, or ChatGPT."
+        )
+
+    def _loop(self) -> None:
+        """队友主循环：IDLE 等任务，WORK 跑 agent_loop。"""
+        while True:
+            with self._changed:
+                self.status = "idle"
+                self.current_prompt = None
+                self.bus.send(
+                    self.name,
+                    "lead",
+                    "Waiting for more work.",
+                    "idle_notification",
+                )
+                while not self._queue and not self._stop_requested:
+                    self._changed.wait()
+                if self._stop_requested and not self._queue:
+                    self.status = "stopped"
+                    self.bus.send(
+                        self.name,
+                        "lead",
+                        "Stopped cleanly.",
+                        "shutdown_response",
+                    )
+                    return
+                prompt = self._queue.pop(0)
+                self.status = "work"
+                self.current_prompt = prompt
+
+            result = self.run_work(prompt)
+            self.bus.send(
+                self.name,
+                "lead",
+                result or "(no result)",
+                "result",
+                {"prompt": prompt},
+            )
+
+    def run_work(self, prompt: str) -> str:
+        """用队友自己的 messages 跑一轮 Agent Loop。"""
+        if ACTIVE_CLIENT is None:
+            return "错误：模型客户端尚未初始化，队友无法工作"
+
+        self.messages.append({"role": "user", "content": prompt})
+        try:
+            return agent_loop(
+                ACTIVE_CLIENT,
+                self.messages,
+                active_request=prompt,
+                tools=TEAMMATE_TOOLS,
+                handlers=TEAMMATE_TOOL_HANDLERS,
+                max_steps=12,
+                agent_name=self.name,
+                print_final=False,
+                extract_memory=False,
+            )
+        except Exception as exc:
+            return f"错误：{self.name} 执行失败：{exc}"
+
+
+class TeamRuntime:
+    """Lead 管理的队友注册表。"""
+
+    def __init__(self, bus: MessageBus) -> None:
+        self.bus = bus
+        self.teammates: Dict[str, TeammateRuntime] = {}
+        self._lock = threading.Lock()
+
+    def spawn(self, name: str, role: str, prompt: str) -> str:
+        """启动或复用一个持久队友，并分配第一项任务。"""
+        self.bus.validate_name(name)
+        with self._lock:
+            teammate = self.teammates.get(name)
+            if teammate is None:
+                teammate = TeammateRuntime(name, role, self.bus)
+                self.teammates[name] = teammate
+            teammate.assign(prompt)
+        return f"Spawned teammate {name} and assigned initial work."
+
+    def send(self, name: str, prompt: str) -> str:
+        """给已有队友发送新的工作消息。"""
+        with self._lock:
+            teammate = self.teammates.get(name)
+            if teammate is None:
+                raise ValueError(f"队友不存在：{name}")
+            return teammate.assign(prompt)
+
+    def shutdown(self, name: str) -> str:
+        """请求已有队友平滑停止。"""
+        with self._lock:
+            teammate = self.teammates.get(name)
+            if teammate is None:
+                raise ValueError(f"队友不存在：{name}")
+            return teammate.request_shutdown()
+
+    def list(self) -> str:
+        """列出所有队友状态。"""
+        with self._lock:
+            if not self.teammates:
+                return "当前没有队友"
+            return "\n".join(
+                teammate.summary()
+                for teammate in self.teammates.values()
+            )
+
+    def consume_lead_inbox(self) -> str:
+        """Lead 在每轮模型调用前消费团队事件。"""
+        return self.bus.format_messages("lead")
+
+
+TEAM = TeamRuntime(BUS)
+
 TOOLS = [
     {
         "type": "function",
@@ -2057,6 +2355,82 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "spawn_teammate",
+            "description": (
+                "Start a persistent teammate agent after the user has "
+                "confirmed the team plan, then assign its initial work."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Teammate name, such as auth_agent.",
+                    },
+                    "role": {
+                        "type": "string",
+                        "description": "Short responsibility description.",
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Initial work prompt for the teammate.",
+                    },
+                },
+                "required": ["name", "role", "prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_teammates",
+            "description": "List persistent teammate agents and their states.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_teammate_message",
+            "description": "Assign additional work to an existing teammate.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Existing teammate name.",
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "New work prompt to assign.",
+                    },
+                },
+                "required": ["name", "prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "request_teammate_shutdown",
+            "description": (
+                "Ask a teammate to stop after its current queued work ends."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Existing teammate name.",
+                    }
+                },
+                "required": ["name"],
+            },
+        },
+    },
 ]
 
 
@@ -2207,6 +2581,13 @@ def inject_scheduled_prompts(messages: List[Dict[str, Any]]) -> None:
     scheduled_prompts = collect_scheduled_prompts()
     for prompt in scheduled_prompts:
         messages.append({"role": "user", "content": prompt})
+
+
+def inject_team_events(messages: List[Dict[str, Any]]) -> None:
+    """Lead 在每轮 LLM 调用前消费队友事件。"""
+    events = TEAM.consume_lead_inbox()
+    if events:
+        messages.append({"role": "user", "content": events})
 
 
 class TodoManager:
@@ -2410,6 +2791,28 @@ def run_cancel_cron(cron_id: str) -> str:
     return CRONS.cancel(cron_id)
 
 
+def run_spawn_teammate(name: str, role: str, prompt: str) -> str:
+    """启动持久队友，并分配初始工作。"""
+    if ACTIVE_CLIENT is None:
+        return "错误：模型客户端尚未初始化，无法启动队友"
+    return TEAM.spawn(name, role, prompt)
+
+
+def run_list_teammates() -> str:
+    """列出当前队友状态。"""
+    return TEAM.list()
+
+
+def run_send_teammate_message(name: str, prompt: str) -> str:
+    """给已有队友追加一项工作。"""
+    return TEAM.send(name, prompt)
+
+
+def run_request_teammate_shutdown(name: str) -> str:
+    """请求队友平滑关机。"""
+    return TEAM.shutdown(name)
+
+
 TOOL_HANDLERS: Dict[str, Callable[..., str]] = {
     "bash": run_bash,
     "read_file": run_read,
@@ -2430,19 +2833,33 @@ TOOL_HANDLERS: Dict[str, Callable[..., str]] = {
     "schedule_cron": run_schedule_cron,
     "list_crons": run_list_crons,
     "cancel_cron": run_cancel_cron,
+    "spawn_teammate": run_spawn_teammate,
+    "list_teammates": run_list_teammates,
+    "send_teammate_message": run_send_teammate_message,
+    "request_teammate_shutdown": run_request_teammate_shutdown,
+}
+
+TEAM_TOOL_NAMES = {
+    "spawn_teammate",
+    "list_teammates",
+    "send_teammate_message",
+    "request_teammate_shutdown",
 }
 
 SUBAGENT_TOOLS = [
     tool
     for tool in TOOLS
-    if tool["function"]["name"] != "task"
+    if tool["function"]["name"] not in {"task", *TEAM_TOOL_NAMES}
 ]
 
 SUBAGENT_TOOL_HANDLERS = {
     name: handler
     for name, handler in TOOL_HANDLERS.items()
-    if name != "task"
+    if name not in {"task", *TEAM_TOOL_NAMES}
 }
+
+TEAMMATE_TOOLS = SUBAGENT_TOOLS
+TEAMMATE_TOOL_HANDLERS = SUBAGENT_TOOL_HANDLERS
 
 
 class PermissionDecision(str, Enum):
@@ -2534,6 +2951,30 @@ def check_permission_rules(
             CRONS.validate_cron_id(cron_id)
         except ValueError as exc:
             return PermissionDecision.DENY, str(exc)
+
+    if tool_name in {
+        "spawn_teammate",
+        "send_teammate_message",
+        "request_teammate_shutdown",
+    }:
+        name = arguments.get("name")
+        try:
+            BUS.validate_name(name)
+        except ValueError as exc:
+            return PermissionDecision.DENY, str(exc)
+
+    if tool_name == "spawn_teammate":
+        role = arguments.get("role")
+        prompt = arguments.get("prompt")
+        if not isinstance(role, str) or not role.strip():
+            return PermissionDecision.DENY, "队友 role 不能为空"
+        if not isinstance(prompt, str) or not prompt.strip():
+            return PermissionDecision.DENY, "队友初始 prompt 不能为空"
+
+    if tool_name == "send_teammate_message":
+        prompt = arguments.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            return PermissionDecision.DENY, "队友消息 prompt 不能为空"
 
     if tool_name in {"read_file", "write_file", "edit_file"}:
         path = arguments.get("path")
@@ -2740,6 +3181,8 @@ def agent_loop(
     for _step in range(max_steps):
         inject_background_results(messages)
         inject_scheduled_prompts(messages)
+        if agent_name == "Agent":
+            inject_team_events(messages)
         messages[:] = COMPACTOR.prepare(client, messages, active_request)
         try:
             response = client.chat.completions.create(
