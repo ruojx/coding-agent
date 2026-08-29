@@ -1,4 +1,4 @@
-"""编程智能体的第十六个版本：增加 Workflow Runtime。"""
+"""编程智能体的第十七个版本：增加 Goal Loop 完成条件判断。"""
 
 import ast
 import datetime as dt
@@ -63,6 +63,8 @@ BASE_SYSTEM_PROMPT = (
     "tool results must flow through the same message pipeline. "
     "Use run_workflow for fixed multi-step procedures where host-side code "
     "should orchestrate phases, retries, journaled steps, and resume. "
+    "When a session goal is active, make tool results explicit enough for "
+    "an independent goal evaluator to verify the completion condition. "
     "Tool calls may be denied by the local permission system. "
     "If a call is denied, do not claim it succeeded; choose a safer approach. "
     "When the task is complete, answer the user directly."
@@ -229,6 +231,16 @@ def runtime_status_summary() -> str:
         sections.append(f"- workflows: {workflow_count} registered")
     except Exception:
         sections.append("- workflows: unavailable")
+
+    try:
+        goal_line = (
+            GOAL.state.condition
+            if GOAL.state is not None and GOAL.state.active
+            else "none"
+        )
+        sections.append(f"- active goal: {goal_line}")
+    except Exception:
+        sections.append("- active goal: unavailable")
 
     return "\n".join(sections)
 
@@ -3463,6 +3475,216 @@ TODO = TodoManager()
 ACTIVE_CLIENT: Optional[OpenAI] = None
 
 
+@dataclass
+class GoalState:
+    """保存当前会话级 Goal 的状态。"""
+
+    condition: str
+    started_at: str
+    checks: int = 0
+    blocks: int = 0
+    last_reason: str = ""
+    active: bool = True
+
+
+@dataclass
+class GoalDecision:
+    """Goal 判断器给 Stop hook 的决定。"""
+
+    action: str
+    reason: str
+
+
+class PromptGoalEvaluator:
+    """独立 Goal 判断器：只读对话，不调用工具。"""
+
+    def evaluate(
+        self,
+        client: OpenAI,
+        goal: GoalState,
+        messages: List[Dict[str, Any]],
+    ) -> GoalDecision:
+        """根据 goal 和当前对话判断是否真的完成。"""
+        prompt = self.build_prompt(goal, messages)
+        try:
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are an independent goal evaluator for a "
+                            "coding agent. You cannot use tools. Decide only "
+                            "from the conversation evidence. Return JSON only: "
+                            '{"ok": boolean, "reason": string, '
+                            '"impossible": boolean}. Do not trust claims that '
+                            "lack concrete tool results."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            content = response.choices[0].message.content or "{}"
+            parsed = json.loads(content)
+        except Exception as exc:
+            return GoalDecision("error", f"Goal 判断失败：{exc}")
+
+        if not isinstance(parsed, dict):
+            return GoalDecision("error", "Goal 判断器没有返回 JSON 对象")
+
+        reason = str(parsed.get("reason", "")).strip() or "没有给出原因"
+        if parsed.get("impossible") is True:
+            return GoalDecision("error", reason)
+        if parsed.get("ok") is True:
+            return GoalDecision("allow", reason)
+        return GoalDecision("block", reason)
+
+    def build_prompt(
+        self,
+        goal: GoalState,
+        messages: List[Dict[str, Any]],
+    ) -> str:
+        """构造判断器输入，保留最近证据并限制超长消息。"""
+        recent = [
+            {
+                "role": message.get("role"),
+                "content": self.trim_message(str(message.get("content", ""))),
+            }
+            for message in messages[-30:]
+        ]
+        return (
+            f"Goal condition:\n{goal.condition}\n\n"
+            "Recent conversation evidence JSON:\n"
+            f"{json.dumps(recent, ensure_ascii=False, default=str)}"
+        )
+
+    def trim_message(self, content: str, limit: int = 3000) -> str:
+        """保留消息头尾，避免单条工具结果挤满判断请求。"""
+        if len(content) <= limit:
+            return content
+        half = limit // 2
+        return (
+            content[:half]
+            + f"\n……中间省略 {len(content) - limit} 个字符……\n"
+            + content[-half:]
+        )
+
+
+class GoalController:
+    """管理 /goal 命令，并在 Stop hook 处决定是否继续。"""
+
+    CLEAR_ALIASES = {"clear", "stop", "off", "reset", "none", "cancel"}
+
+    def __init__(
+        self,
+        evaluator: PromptGoalEvaluator,
+        max_blocks: int = 5,
+    ) -> None:
+        self.evaluator = evaluator
+        self.max_blocks = max_blocks
+        self.state: Optional[GoalState] = None
+
+    def set(self, condition: str) -> str:
+        """设置或替换当前会话 Goal。"""
+        condition = condition.strip() if isinstance(condition, str) else ""
+        if not condition:
+            return "错误：Goal 条件不能为空"
+        self.state = GoalState(
+            condition=condition,
+            started_at=dt.datetime.now().isoformat(timespec="seconds"),
+        )
+        return f"已设置 Goal：{condition}"
+
+    def clear(self) -> str:
+        """清除当前 Goal。"""
+        self.state = None
+        return "已清除当前 Goal"
+
+    def status(self) -> str:
+        """查看当前 Goal 状态。"""
+        if self.state is None or not self.state.active:
+            return "当前没有活跃 Goal"
+        elapsed = dt.datetime.now() - dt.datetime.fromisoformat(
+            self.state.started_at
+        )
+        return (
+            f"Goal：{self.state.condition}\n"
+            f"检查次数：{self.state.checks}\n"
+            f"连续未通过：{self.state.blocks}\n"
+            f"已运行：{int(elapsed.total_seconds())} 秒\n"
+            f"最近原因：{self.state.last_reason or '(none)'}"
+        )
+
+    def handle_command(self, query: str) -> Optional[str]:
+        """解析 /goal 命令；返回需要交给主 Agent 的任务文本。"""
+        if not query.startswith("/goal"):
+            return None
+        condition = query[len("/goal"):].strip()
+        if not condition:
+            print(self.status())
+            return ""
+        if condition.lower() in self.CLEAR_ALIASES:
+            print(self.clear())
+            return ""
+
+        print(self.set(condition))
+        return (
+            f"[Goal]\n{condition}\n\n"
+            "请开始完成这个目标。每次运行验证命令后，明确写出命令、"
+            "关键输出和退出码，方便独立 Goal 判断器检查。"
+        )
+
+    def evaluate_after_turn(
+        self, messages: List[Dict[str, Any]]
+    ) -> Optional[str]:
+        """Stop hook 入口：决定允许结束，还是把原因塞回主循环。"""
+        if self.state is None or not self.state.active:
+            return None
+        if self.has_running_background_tasks():
+            self.state.last_reason = "后台任务仍在运行，暂缓 Goal 判断"
+            return (
+                "<goal_defer>后台任务仍在运行；请等待后台通知进入上下文后，"
+                "再继续判断 Goal 是否完成。</goal_defer>"
+            )
+        if ACTIVE_CLIENT is None:
+            self.state.last_reason = "模型客户端未初始化，无法判断 Goal"
+            return None
+
+        self.state.checks += 1
+        decision = self.evaluator.evaluate(ACTIVE_CLIENT, self.state, messages)
+        self.state.last_reason = decision.reason
+
+        if decision.action == "allow":
+            self.state.active = False
+            return None
+
+        if decision.action == "block":
+            self.state.blocks += 1
+            if self.state.blocks > self.max_blocks:
+                return (
+                    "<goal_blocked>Goal 还没有被证明完成，但自动继续次数"
+                    "已经达到上限。请用户确认下一步。\n"
+                    f"最近原因：{decision.reason}</goal_blocked>"
+                )
+            return (
+                "<goal_continue>Goal 尚未满足，请继续完成。判断器原因："
+                f"{decision.reason}</goal_continue>"
+            )
+
+        return (
+            "<goal_error>Goal 判断失败，先把控制权交还用户。"
+            f"原因：{decision.reason}</goal_error>"
+        )
+
+    def has_running_background_tasks(self) -> bool:
+        """后台任务仍在 running 时，Goal 先不判断。"""
+        with BACKGROUND._lock:
+            return any(task.status == "running" for task in BACKGROUND.tasks.values())
+
+
+GOAL = GoalController(PromptGoalEvaluator())
+
+
 def run_todo_write(todos: Any) -> str:
     """更新当前任务计划；这个工具只负责规划，不直接修改文件。"""
     output = TODO.update(todos)
@@ -3990,10 +4212,16 @@ def stop_summary_hook(messages: List[Dict[str, Any]]) -> None:
     return None
 
 
+def goal_stop_hook(messages: List[Dict[str, Any]]) -> Optional[str]:
+    """Stop：有活跃 Goal 时，独立判断是否允许真正结束。"""
+    return GOAL.evaluate_after_turn(messages)
+
+
 register_hook("UserPromptSubmit", prompt_context_hook)
 register_hook("PreToolUse", permission_hook)
 register_hook("PreToolUse", tool_log_hook)
 register_hook("PostToolUse", large_output_hook)
+register_hook("Stop", goal_stop_hook)
 register_hook("Stop", stop_summary_hook)
 
 
@@ -4246,6 +4474,12 @@ def main() -> None:
             continue
 
         trigger_hooks("UserPromptSubmit", query)
+        goal_prompt = GOAL.handle_command(query)
+        if goal_prompt == "":
+            continue
+        if goal_prompt is not None:
+            query = goal_prompt
+
         messages.append({"role": "user", "content": query})
         agent_loop(
             client, messages, active_request=query, extract_memory=True
